@@ -1,0 +1,4 @@
+nodeCount: 2
+modules:
+    - SimpleWriteModule
+    - SimpleCompactModule
