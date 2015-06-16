@@ -64,9 +64,16 @@ public class CCMBridge extends Bridge
         execute("ccm remove");
     }
 
+<<<<<<< HEAD
     public void start()
     {
         execute("ccm start");
+=======
+    public String readNodeLog()
+    {
+        String result = executeAndRead("ccm checklogerror");
+        return result;
+>>>>>>> 6e98dadeea7cd69a535badc91ba6165654639228
     }
 
     public void stop()
@@ -176,4 +183,8 @@ public class CCMBridge extends Bridge
             throw new RuntimeException(e);
         }
     }
+<<<<<<< HEAD
+=======
+
+>>>>>>> 6e98dadeea7cd69a535badc91ba6165654639228
 }

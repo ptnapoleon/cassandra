@@ -29,19 +29,19 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.concurrent.Future;
 
+import com.google.common.io.ByteStreams;
 import org.junit.After;
 import org.junit.Assert;
+import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
-import org.junit.Test;
 
-import com.google.common.io.ByteStreams;
 import org.apache.cassandra.bridges.Bridge;
 import org.apache.cassandra.bridges.ccmbridge.CCMBridge;
-import org.apache.cassandra.htest.Config;
 import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.htest.Config;
 import org.apache.cassandra.io.util.FileUtils;
-import org.apache.cassandra.modules.*;
+import org.apache.cassandra.modules.Module;
 import org.yaml.snakeyaml.Yaml;
 import org.yaml.snakeyaml.error.YAMLException;
 
@@ -115,7 +115,13 @@ public class HarnessTest
     public void tearDown()
     {
         String result = cluster.readNodeLog();
+<<<<<<< HEAD:test/validation/org/apache/cassandra/HarnessTest.java
         cluster.destroy();
+=======
+
+        cluster.destroy();
+
+>>>>>>> 6e98dadeea7cd69a535badc91ba6165654639228:test/validation/org/apache/cassandra/HarnessTester.java
         Assert.assertTrue(result, result == null);
     }
 
