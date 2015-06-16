@@ -23,4 +23,6 @@ package org.apache.cassandra.bridges;
 public abstract class Bridge
 {
     public abstract void destroy();
+
+    public abstract String readNodeLog();
 }
