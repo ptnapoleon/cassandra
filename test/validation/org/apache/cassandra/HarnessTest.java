@@ -114,7 +114,9 @@ public class HarnessTest
     @After
     public void tearDown()
     {
+        String result = cluster.readNodeLog();
         cluster.destroy();
+        Assert.assertTrue(result, result == null);
     }
 
     public Module reflectModuleByName(String moduleName, Config config)
