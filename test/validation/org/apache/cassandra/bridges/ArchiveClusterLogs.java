@@ -20,12 +20,20 @@
  */
 package org.apache.cassandra.bridges;
 
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
+import java.io.FileReader;
+import java.io.FileWriter;
 import java.io.IOException;
+import java.io.PrintWriter;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
+
+import org.apache.cassandra.bridges.ccmbridge.CCMBridge;
 
 public class ArchiveClusterLogs
 {
@@ -93,6 +101,64 @@ public class ArchiveClusterLogs
         catch (IOException e)
         {
             throw new RuntimeException(e);
+        }
+    }
+
+    public static void savetempDirectoryPath(File CASSANDRA_DIR, File tmp_Dir)
+    {
+        File filePath = new File(CASSANDRA_DIR + "/build/test/logs/validation/tempDir.txt");
+
+        try
+        {
+            if(!filePath.exists())
+            {
+                filePath.getParentFile().mkdirs();
+            }
+            PrintWriter pw = new PrintWriter(new BufferedWriter(new FileWriter(filePath, true)));
+            pw.println(tmp_Dir);
+            pw.close();
+        }
+        catch (IOException e)
+        {
+            throw new RuntimeException(e);
+        }
+    }
+
+    public static void removeOldCluster(File CASSANDRA_DIR)
+    {
+        File filePath = new File(CASSANDRA_DIR + "/build/test/logs/validation/tempDir.txt");
+
+        if (filePath.exists())
+        {
+            try
+            {
+                BufferedReader br = new BufferedReader(new FileReader(filePath));
+                String line = br.readLine();
+                String tmpDir = null;
+
+                while(line != null){
+
+                    tmpDir = line;
+                    line = br.readLine();
+                }
+
+                File tempDir = new File(tmpDir);
+                if (tempDir.exists())
+                {
+                    if(tempDir.list().length > 0)
+                    {
+                        CCMBridge.removeLiveCluster(tmpDir);
+                    }
+                }
+            }
+            catch (FileNotFoundException e)
+            {
+                throw new RuntimeException(e);
+            }
+            catch (IOException e)
+            {
+                throw new RuntimeException(e);
+            }
         }
     }
 }

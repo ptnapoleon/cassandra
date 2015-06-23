@@ -52,6 +52,8 @@ public class CCMBridge extends Bridge
     {
         this.nodeCount = nodeCount;
         this.ccmDir = Files.createTempDir();
+        ArchiveClusterLogs.removeOldCluster(CASSANDRA_DIR);
+        ArchiveClusterLogs.savetempDirectoryPath(CASSANDRA_DIR, ccmDir);
         execute("ccm create %s -n %d --install-dir %s", DEFAULT_CLUSTER_NAME, nodeCount, CASSANDRA_DIR);
     }
 
@@ -198,7 +200,7 @@ public class CCMBridge extends Bridge
             }
             catch (IOException e)
             {
-                e.printStackTrace();
+                throw new RuntimeException(e);
             }
         }
     }
@@ -209,4 +211,17 @@ public class CCMBridge extends Bridge
         executeAndPrint(fullCommand);
     }
 
+    public static void removeLiveCluster(String temp_dir)
+    {
+        String fullCommand = "ccm remove" + " --config-dir=" + temp_dir;
+        try
+        {
+            logger.debug("Executing: " + fullCommand);
+            Process p = runtime.exec(fullCommand, null, CASSANDRA_DIR);
+        }
+        catch (IOException e)
+        {
+            throw new RuntimeException(e);
+        }
+    }
 }
