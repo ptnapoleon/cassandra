@@ -46,11 +46,18 @@ public abstract class Functions
     static
     {
         declare(AggregateFcts.countRowsFunction);
-        declare(TimeuuidFcts.nowFct);
-        declare(TimeuuidFcts.minTimeuuidFct);
-        declare(TimeuuidFcts.maxTimeuuidFct);
-        declare(TimeuuidFcts.dateOfFct);
-        declare(TimeuuidFcts.unixTimestampOfFct);
+        declare(TimeFcts.nowFct);
+        declare(TimeFcts.minTimeuuidFct);
+        declare(TimeFcts.maxTimeuuidFct);
+        declare(TimeFcts.dateOfFct);
+        declare(TimeFcts.unixTimestampOfFct);
+        declare(TimeFcts.timeUuidtoDate);
+        declare(TimeFcts.timeUuidToTimestamp);
+        declare(TimeFcts.timeUuidToUnixTimestamp);
+        declare(TimeFcts.timestampToDate);
+        declare(TimeFcts.timestampToUnixTimestamp);
+        declare(TimeFcts.dateToTimestamp);
+        declare(TimeFcts.dateToUnixTimestamp);
         declare(UuidFcts.uuidFct);
 
         for (CQL3Type type : CQL3Type.Native.values())
@@ -287,11 +294,10 @@ public abstract class Functions
         return sb.toString();
     }
 
-    // This is *not* thread safe but is only called in SchemaTables that is synchronized.
-    public static void addFunction(AbstractFunction fun)
+    public static void addOrReplaceFunction(AbstractFunction fun)
     {
         // We shouldn't get there unless that function don't exist
-        assert find(fun.name(), fun.argTypes()) == null;
+        removeFunction(fun.name(), fun.argTypes());
         declare(fun);
     }
 
@@ -313,15 +319,7 @@ public abstract class Functions
                     declared.remove(name);
                 return;
             }
-            assert false : "Function " + name + " not declared";
         }
-    }
-
-    // Same remarks than for addFunction
-    public static void replaceFunction(AbstractFunction fun)
-    {
-        removeFunction(fun.name(), fun.argTypes());
-        addFunction(fun);
     }
 
     public static List<Function> getReferencesTo(Function old)

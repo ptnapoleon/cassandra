@@ -96,6 +96,7 @@ public class NodeTool
                 RemoveNode.class,
                 Assassinate.class,
                 Repair.class,
+                ReplayBatchlog.class,
                 SetCacheCapacity.class,
                 SetHintedHandoffThrottleInKB.class,
                 SetCompactionThreshold.class,
@@ -237,6 +238,8 @@ public class NodeTool
             try (NodeProbe probe = connect())
             {
                 execute(probe);
+                if (probe.isFailed())
+                    throw new RuntimeException("nodetool failed, check server logs");
             }
             catch (IOException e)
             {

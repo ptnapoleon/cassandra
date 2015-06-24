@@ -245,6 +245,30 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
         }
     }
 
+    public static Runnable getBackgroundCompactionTaskSubmitter()
+    {
+        return new Runnable()
+        {
+            public void run()
+            {
+                List<ColumnFamilyStore> submitted = new ArrayList<>();
+                for (Keyspace keyspace : Keyspace.all())
+                    for (ColumnFamilyStore cfs : keyspace.getColumnFamilyStores())
+                        if (!CompactionManager.instance.submitBackground(cfs, false).isEmpty())
+                            submitted.add(cfs);
+
+                while (!submitted.isEmpty() && CompactionManager.instance.getActiveCompactions() < CompactionManager.instance.getMaximumCompactorThreads())
+                {
+                    List<ColumnFamilyStore> submitMore = ImmutableList.copyOf(submitted);
+                    submitted.clear();
+                    for (ColumnFamilyStore cfs : submitMore)
+                        if (!CompactionManager.instance.submitBackground(cfs, false).isEmpty())
+                            submitted.add(cfs);
+                }
+            }
+        };
+    }
+
     public void setCompactionStrategyClass(String compactionStrategyClass)
     {
         try
@@ -2596,8 +2620,6 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
             {
                 assert data.getCompacting().isEmpty() : data.getCompacting();
                 Collection<SSTableReader> sstables = Lists.newArrayList(AbstractCompactionStrategy.filterSuspectSSTables(getSSTables()));
-                if (Iterables.isEmpty(sstables))
-                    return null;
                 LifecycleTransaction modifier = data.tryModify(sstables, operationType);
                 assert modifier != null: "something marked things compacting while compactions are disabled";
                 return modifier;
