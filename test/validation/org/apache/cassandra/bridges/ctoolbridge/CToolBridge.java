@@ -32,6 +32,8 @@ import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.datastax.driver.core.Cluster;
+import com.datastax.driver.core.Session;
 import edu.nyu.cs.javagit.api.DotGit;
 import edu.nyu.cs.javagit.api.Ref;
 import edu.nyu.cs.javagit.api.WorkingTree;
@@ -47,6 +49,7 @@ public class CToolBridge extends Bridge
     private int nodeCount;
     JSONObject cassObj = new JSONObject();
     int bootstrap_attempts = 0;
+    int checkCass = 0;
     static final File CASSANDRA_DIR = new File("./");
     private final String DEFAULT_CLUSTER_NAME = "validation";
 
@@ -90,6 +93,7 @@ public class CToolBridge extends Bridge
     public void start()
     {
         executeRun("fab -f ~/cstar_perf/tool/cstar_perf/tool/fab_cassandra.py start", "0");
+        checkCassRunning();
     }
 
     public void stop()
@@ -444,6 +448,31 @@ public class CToolBridge extends Bridge
             {
                 executeRun("echo \"broadcast_rpc_address: " + endpoints[count] + "\" | tee -a ~/fab/cassandra/conf/cassandra.yaml", node);
             }
+        }
+    }
+
+    public void checkCassRunning()
+    {
+        checkCass += 1;
+
+        if(checkCass <= 6)
+        {
+            try
+            {
+                Thread.sleep(10000);
+                Cluster cluster = Cluster.builder().addContactPoints(clusterEndpoints()[0]).build();
+                Session session = cluster.connect();
+                session.close();
+                cluster.close();
+            }
+            catch (Exception e)
+            {
+                checkCassRunning();
+            }
+        }
+        else
+        {
+            throw new RuntimeException("Unable to start Cassandra!!!");
         }
     }
 }
