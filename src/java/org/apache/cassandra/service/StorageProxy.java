@@ -24,17 +24,16 @@ import java.nio.ByteBuffer;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
+import javax.annotation.Nullable;
 import javax.management.MBeanServer;
 import javax.management.ObjectName;
 
+import com.google.common.base.Function;
 import com.google.common.base.Predicate;
 import com.google.common.cache.CacheLoader;
 import com.google.common.collect.*;
 import com.google.common.util.concurrent.Uninterruptibles;
-
-import org.apache.cassandra.db.view.MaterializedViewManager;
-import org.apache.cassandra.db.view.MaterializedViewUtils;
-import org.apache.cassandra.metrics.*;
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -45,29 +44,31 @@ import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.config.Schema;
 import org.apache.cassandra.db.*;
-import org.apache.cassandra.db.rows.*;
-import org.apache.cassandra.db.partitions.*;
+import org.apache.cassandra.db.filter.DataLimits;
 import org.apache.cassandra.db.filter.TombstoneOverwhelmingException;
-import org.apache.cassandra.db.index.SecondaryIndexSearcher;
 import org.apache.cassandra.db.marshal.UUIDType;
-import org.apache.cassandra.dht.AbstractBounds;
-import org.apache.cassandra.dht.Bounds;
-import org.apache.cassandra.dht.RingPosition;
-import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.db.partitions.*;
+import org.apache.cassandra.db.rows.RowIterator;
+import org.apache.cassandra.db.view.MaterializedViewManager;
+import org.apache.cassandra.db.view.MaterializedViewUtils;
+import org.apache.cassandra.dht.*;
 import org.apache.cassandra.exceptions.*;
 import org.apache.cassandra.gms.FailureDetector;
 import org.apache.cassandra.gms.Gossiper;
+import org.apache.cassandra.hints.Hint;
+import org.apache.cassandra.hints.HintsService;
+import org.apache.cassandra.index.Index;
 import org.apache.cassandra.io.util.DataOutputBuffer;
-import org.apache.cassandra.locator.AbstractReplicationStrategy;
-import org.apache.cassandra.locator.IEndpointSnitch;
-import org.apache.cassandra.locator.LocalStrategy;
-import org.apache.cassandra.locator.TokenMetadata;
+import org.apache.cassandra.locator.*;
+import org.apache.cassandra.metrics.*;
 import org.apache.cassandra.net.*;
-import org.apache.cassandra.service.paxos.*;
+import org.apache.cassandra.service.paxos.Commit;
+import org.apache.cassandra.service.paxos.PrepareCallback;
+import org.apache.cassandra.service.paxos.ProposeCallback;
 import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.triggers.TriggerExecutor;
-import org.apache.cassandra.utils.*;
 import org.apache.cassandra.utils.AbstractIterator;
+import org.apache.cassandra.utils.*;
 
 public class StorageProxy implements StorageProxyMBean
 {
@@ -99,7 +100,9 @@ public class StorageProxy implements StorageProxyMBean
 
     private static final double CONCURRENT_SUBREQUESTS_MARGIN = 0.10;
 
-    private StorageProxy() {}
+    private StorageProxy()
+    {
+    }
 
     static
     {
@@ -112,6 +115,9 @@ public class StorageProxy implements StorageProxyMBean
         {
             throw new RuntimeException(e);
         }
+
+        HintsService.instance.registerMBean();
+        HintedHandOffManager.instance.registerMBean();
 
         standardWritePerformer = new WritePerformer()
         {
@@ -603,32 +609,41 @@ public class StorageProxy implements StorageProxyMBean
         }
     }
 
-    /** hint all the mutations (except counters, which can't be safely retried).  This means
-      * we'll re-hint any successful ones; doesn't seem worth it to track individual success
-      * just for this unusual case.
-
-      * @param mutations the mutations that require hints
-      */
+    /**
+     * Hint all the mutations (except counters, which can't be safely retried).  This means
+     * we'll re-hint any successful ones; doesn't seem worth it to track individual success
+     * just for this unusual case.
+     *
+     * Only used for CL.ANY
+     *
+     * @param mutations the mutations that require hints
+     */
     private static void hintMutations(Collection<? extends IMutation> mutations)
     {
         for (IMutation mutation : mutations)
-        {
-            if (mutation instanceof CounterMutation)
-                continue;
+            if (!(mutation instanceof CounterMutation))
+                hintMutation((Mutation) mutation);
 
-            Token tk = mutation.key().getToken();
-            List<InetAddress> naturalEndpoints = StorageService.instance.getNaturalEndpoints(mutation.getKeyspaceName(), tk);
-            Collection<InetAddress> pendingEndpoints = StorageService.instance.getTokenMetadata().pendingEndpointsFor(tk, mutation.getKeyspaceName());
-            for (InetAddress target : Iterables.concat(naturalEndpoints, pendingEndpoints))
-            {
-                // local writes can timeout, but cannot be dropped (see LocalMutationRunnable and
-                // CASSANDRA-6510), so there is no need to hint or retry
-                if (!target.equals(FBUtilities.getBroadcastAddress()) && shouldHint(target))
-                    submitHint((Mutation) mutation, target, null);
-            }
-        }
+        Tracing.trace("Wrote hints to satisfy CL.ANY after no replicas acknowledged the write");
+    }
 
-        Tracing.trace("Wrote hint to satisfy CL.ANY after no replicas acknowledged the write");
+    private static void hintMutation(Mutation mutation)
+    {
+        Token tk = DatabaseDescriptor.getPartitioner().getToken(mutation.key().getKey());
+        List<InetAddress> naturalEndpoints = StorageService.instance.getNaturalEndpoints(mutation.getKeyspaceName(), tk);
+        Collection<InetAddress> pendingEndpoints =
+            StorageService.instance.getTokenMetadata().pendingEndpointsFor(tk, mutation.getKeyspaceName());
+
+        Iterable<InetAddress> endpoints = Iterables.concat(naturalEndpoints, pendingEndpoints);
+        ArrayList<InetAddress> endpointsToHint = new ArrayList<>(Iterables.size(endpoints));
+
+        // local writes can timeout, but cannot be dropped (see LocalMutationRunnable and CASSANDRA-6510),
+        // so there is no need to hint or retry.
+        for (InetAddress target : endpoints)
+            if (!target.equals(FBUtilities.getBroadcastAddress()) && shouldHint(target))
+                endpointsToHint.add(target);
+
+        submitHint(mutation, endpointsToHint, null);
     }
 
     /**
@@ -663,7 +678,8 @@ public class StorageProxy implements StorageProxyMBean
             {
                 String keyspaceName = mutation.getKeyspaceName();
                 Token tk = mutation.key().getToken();
-                List<InetAddress> naturalEndpoints = Lists.newArrayList(MaterializedViewUtils.getViewNaturalEndpoint(keyspaceName, baseToken, tk));
+                InetAddress pairedEndpoint = MaterializedViewUtils.getViewNaturalEndpoint(keyspaceName, baseToken, tk);
+                List<InetAddress> naturalEndpoints = Lists.newArrayList(pairedEndpoint);
 
                 WriteResponseHandlerWrapper wrapper = wrapMVBatchResponseHandler(mutation,
                                                                                  consistencyLevel,
@@ -672,14 +688,27 @@ public class StorageProxy implements StorageProxyMBean
                                                                                  WriteType.BATCH,
                                                                                  cleanup);
 
-                wrappers.add(wrapper);
-
-                //Apply to local batchlog memtable in this thread
-                BatchlogManager.getBatchlogMutationFor(mutations, batchUUID, MessagingService.current_version).apply();
+                //When local node is the endpoint and there are no pending nodes we can
+                // Just apply the mutation locally.
+                if (pairedEndpoint.equals(FBUtilities.getBroadcastAddress()) &&
+                    wrapper.handler.pendingEndpoints.isEmpty())
+                {
+                    mutation.apply();
+                }
+                else
+                {
+                    wrappers.add(wrapper);
+                }
             }
 
-            // now actually perform the writes and wait for them to complete
-            asyncWriteBatchedMutations(wrappers, localDataCenter, Stage.MATERIALIZED_VIEW_MUTATION);
+            if (!wrappers.isEmpty())
+            {
+                //Apply to local batchlog memtable in this thread
+                BatchlogManager.getBatchlogMutationFor(Lists.transform(wrappers, w -> w.mutation), batchUUID, MessagingService.current_version).apply();
+
+                // now actually perform the writes and wait for them to complete
+                asyncWriteBatchedMutations(wrappers, localDataCenter, Stage.MATERIALIZED_VIEW_MUTATION);
+            }
         }
         catch (WriteTimeoutException ex)
         {
@@ -1071,7 +1100,7 @@ public class StorageProxy implements StorageProxyMBean
         MessageOut<Mutation> message = null;
 
         boolean insertLocal = false;
-
+        ArrayList<InetAddress> endpointsToHint = null;
 
         for (InetAddress destination : targets)
         {
@@ -1115,15 +1144,20 @@ public class StorageProxy implements StorageProxyMBean
                         messages.add(destination);
                     }
                 }
-            } else
+            }
+            else
             {
-                if (!shouldHint(destination))
-                    continue;
-
-                // Schedule a local hint
-                submitHint(mutation, destination, responseHandler);
+                if (shouldHint(destination))
+                {
+                    if (endpointsToHint == null)
+                        endpointsToHint = new ArrayList<>(Iterables.size(targets));
+                    endpointsToHint.add(destination);
+                }
             }
         }
+
+        if (endpointsToHint != null)
+            submitHint(mutation, endpointsToHint, responseHandler);
 
         if (insertLocal)
             insertLocal(stage, mutation, responseHandler);
@@ -1137,66 +1171,6 @@ public class StorageProxy implements StorageProxyMBean
             for (Collection<InetAddress> dcTargets : dcGroups.values())
                 sendMessagesToNonlocalDC(message, dcTargets, responseHandler);
         }
-    }
-
-    private static AtomicInteger getHintsInProgressFor(InetAddress destination)
-    {
-        try
-        {
-            return hintsInProgress.load(destination);
-        }
-        catch (Exception e)
-        {
-            throw new AssertionError(e);
-        }
-    }
-
-    public static Future<Void> submitHint(final Mutation mutation,
-                                          final InetAddress target,
-                                          final AbstractWriteResponseHandler<IMutation> responseHandler)
-    {
-        // local write that time out should be handled by LocalMutationRunnable
-        assert !target.equals(FBUtilities.getBroadcastAddress()) : target;
-
-        HintRunnable runnable = new HintRunnable(target)
-        {
-            public void runMayThrow()
-            {
-                int ttl = HintedHandOffManager.calculateHintTTL(mutation);
-                if (ttl > 0)
-                {
-                    logger.debug("Adding hint for {}", target);
-                    writeHintForMutation(mutation, System.currentTimeMillis(), ttl, target);
-                    // Notify the handler only for CL == ANY
-                    if (responseHandler != null && responseHandler.consistencyLevel == ConsistencyLevel.ANY)
-                        responseHandler.response(null);
-                } else
-                {
-                    logger.debug("Skipped writing hint for {} (ttl {})", target, ttl);
-                }
-            }
-        };
-
-        return submitHint(runnable);
-    }
-
-    private static Future<Void> submitHint(HintRunnable runnable)
-    {
-        StorageMetrics.totalHintsInProgress.inc();
-        getHintsInProgressFor(runnable.target).incrementAndGet();
-        return (Future<Void>) StageManager.getStage(Stage.MUTATION).submit(runnable);
-    }
-
-    /**
-     * @param now current time in milliseconds - relevant for hint replay handling of truncated CFs
-     */
-    public static void writeHintForMutation(Mutation mutation, long now, int ttl, InetAddress target)
-    {
-        assert ttl > 0;
-        UUID hostId = StorageService.instance.getTokenMetadata().getHostId(target);
-        assert hostId != null : "Missing host ID for " + target.getHostAddress();
-        HintedHandOffManager.instance.hintFor(mutation, now, ttl, hostId).apply();
-        StorageMetrics.totalHints.inc();
     }
 
     private static void sendMessagesToNonlocalDC(MessageOut<? extends IMutation> message,
@@ -1736,11 +1710,10 @@ public class StorageProxy implements StorageProxyMBean
     private static float estimateResultsPerRange(PartitionRangeReadCommand command, Keyspace keyspace)
     {
         ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(command.metadata().cfId);
-        SecondaryIndexSearcher searcher = cfs.indexManager.getBestIndexSearcherFor(command);
-
-        float maxExpectedResults = searcher == null
+        Index index = cfs.indexManager.getBestIndexFor(command);
+        float maxExpectedResults = index == null
                                  ? command.limits().estimateTotalResults(cfs)
-                                 : searcher.highestSelectivityIndex(command.rowFilter()).estimateResultRows();
+                                 : index.getEstimatedResultRows();
 
         // adjust maxExpectedResults by the number of tokens this node has and the replication factor for this ks
         return (maxExpectedResults / DatabaseDescriptor.getNumTokens()) / keyspace.getReplicationStrategy().getReplicationFactor();
@@ -2000,7 +1973,9 @@ public class StorageProxy implements StorageProxyMBean
             }
 
             Tracing.trace("Submitted {} concurrent range requests", concurrentQueries.size());
-            return new CountingPartitionIterator(PartitionIterators.concat(concurrentQueries), command.limits(), command.nowInSec());
+            // We want to count the results for the sake of updating the concurrency factor (see updateConcurrencyFactor) but we don't want to
+            // enforce any particular limit at this point (this could break code than rely on postReconciliationProcessing), hence the DataLimits.NONE.
+            return new CountingPartitionIterator(PartitionIterators.concat(concurrentQueries), DataLimits.NONE, command.nowInSec());
         }
 
         public void close()
@@ -2041,7 +2016,8 @@ public class StorageProxy implements StorageProxyMBean
         Tracing.trace("Submitting range requests on {} ranges with a concurrency of {} ({} rows per range expected)", ranges.rangeCount(), concurrencyFactor, resultsPerRange);
 
         // Note that in general, a RangeCommandIterator will honor the command limit for each range, but will not enforce it globally.
-        return command.postReconciliationProcessing(command.limits().filter(new RangeCommandIterator(ranges, command, concurrencyFactor, keyspace, consistencyLevel), command.nowInSec()));
+
+        return command.limits().filter(command.postReconciliationProcessing(new RangeCommandIterator(ranges, command, concurrencyFactor, keyspace, consistencyLevel)), command.nowInSec());
     }
 
     public Map<String, List<String>> getSchemaVersions()
@@ -2209,7 +2185,7 @@ public class StorageProxy implements StorageProxyMBean
     {
         if (!DatabaseDescriptor.hintedHandoffEnabled())
         {
-            HintedHandOffManager.instance.metrics.incrPastWindow(ep);
+            HintsService.instance.metrics.incrPastWindow(ep);
             return false;
         }
 
@@ -2220,7 +2196,7 @@ public class StorageProxy implements StorageProxyMBean
             if (disabledDCs.contains(dc))
             {
                 Tracing.trace("Not hinting {} since its data center {} has been disabled {}", ep, dc, disabledDCs);
-                HintedHandOffManager.instance.metrics.incrPastWindow(ep);
+                HintsService.instance.metrics.incrPastWindow(ep);
                 return false;
             }
         }
@@ -2228,7 +2204,7 @@ public class StorageProxy implements StorageProxyMBean
         boolean hintWindowExpired = Gossiper.instance.getEndpointDowntime(ep) > DatabaseDescriptor.getMaxHintWindow();
         if (hintWindowExpired)
         {
-            HintedHandOffManager.instance.metrics.incrPastWindow(ep);
+            HintsService.instance.metrics.incrPastWindow(ep);
             Tracing.trace("Not hinting {} which has been down {} ms", ep, Gossiper.instance.getEndpointDowntime(ep));
         }
         return !hintWindowExpired;
@@ -2363,7 +2339,7 @@ public class StorageProxy implements StorageProxyMBean
             if (System.currentTimeMillis() > constructionTime + DatabaseDescriptor.getTimeout(MessagingService.Verb.MUTATION))
             {
                 MessagingService.instance().incrementDroppedMessages(MessagingService.Verb.MUTATION);
-                HintRunnable runnable = new HintRunnable(FBUtilities.getBroadcastAddress())
+                HintRunnable runnable = new HintRunnable(Collections.singleton(FBUtilities.getBroadcastAddress()))
                 {
                     protected void runMayThrow() throws Exception
                     {
@@ -2393,11 +2369,11 @@ public class StorageProxy implements StorageProxyMBean
      */
     private abstract static class HintRunnable implements Runnable
     {
-        public final InetAddress target;
+        public final Collection<InetAddress> targets;
 
-        protected HintRunnable(InetAddress target)
+        protected HintRunnable(Collection<InetAddress> targets)
         {
-            this.target = target;
+            this.targets = targets;
         }
 
         public void run()
@@ -2412,8 +2388,9 @@ public class StorageProxy implements StorageProxyMBean
             }
             finally
             {
-                StorageMetrics.totalHintsInProgress.dec();
-                getHintsInProgressFor(target).decrementAndGet();
+                StorageMetrics.totalHintsInProgress.dec(targets.size());
+                for (InetAddress target : targets)
+                    getHintsInProgressFor(target).decrementAndGet();
             }
         }
 
@@ -2444,6 +2421,52 @@ public class StorageProxy implements StorageProxyMBean
     {
         if (getHintsInProgress() > 0)
             logger.warn("Some hints were not written before shutdown.  This is not supposed to happen.  You should (a) run repair, and (b) file a bug report");
+    }
+
+    private static AtomicInteger getHintsInProgressFor(InetAddress destination)
+    {
+        try
+        {
+            return hintsInProgress.load(destination);
+        }
+        catch (Exception e)
+        {
+            throw new AssertionError(e);
+        }
+    }
+
+    public static Future<Void> submitHint(Mutation mutation, InetAddress target, AbstractWriteResponseHandler<IMutation> responseHandler)
+    {
+        return submitHint(mutation, Collections.singleton(target), responseHandler);
+    }
+
+    public static Future<Void> submitHint(Mutation mutation,
+                                          Collection<InetAddress> targets,
+                                          AbstractWriteResponseHandler<IMutation> responseHandler)
+    {
+        HintRunnable runnable = new HintRunnable(targets)
+        {
+            public void runMayThrow()
+            {
+                logger.debug("Adding hints for {}", targets);
+                HintsService.instance.write(Iterables.transform(targets, StorageService.instance::getHostIdForEndpoint),
+                                            Hint.create(mutation, System.currentTimeMillis()));
+                targets.forEach(HintsService.instance.metrics::incrCreatedHints);
+                // Notify the handler only for CL == ANY
+                if (responseHandler != null && responseHandler.consistencyLevel == ConsistencyLevel.ANY)
+                    responseHandler.response(null);
+            }
+        };
+
+        return submitHint(runnable);
+    }
+
+    private static Future<Void> submitHint(HintRunnable runnable)
+    {
+        StorageMetrics.totalHintsInProgress.inc(runnable.targets.size());
+        for (InetAddress target : runnable.targets)
+            getHintsInProgressFor(target).incrementAndGet();
+        return (Future<Void>) StageManager.getStage(Stage.MUTATION).submit(runnable);
     }
 
     public Long getRpcTimeout() { return DatabaseDescriptor.getRpcTimeout(); }
@@ -2478,11 +2501,11 @@ public class StorageProxy implements StorageProxyMBean
     public long getReadRepairAttempted() {
         return ReadRepairMetrics.attempted.getCount();
     }
-    
+
     public long getReadRepairRepairedBlocking() {
         return ReadRepairMetrics.repairedBlocking.getCount();
     }
-    
+
     public long getReadRepairRepairedBackground() {
         return ReadRepairMetrics.repairedBackground.getCount();
     }

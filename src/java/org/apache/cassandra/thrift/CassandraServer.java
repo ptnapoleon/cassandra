@@ -30,20 +30,23 @@ import java.util.zip.Inflater;
 import com.google.common.base.Joiner;
 import com.google.common.collect.*;
 import com.google.common.primitives.Longs;
+
+import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.db.filter.ColumnFilter;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
 import org.apache.cassandra.auth.Permission;
 import org.apache.cassandra.config.*;
 import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.cql3.statements.ParsedStatement;
 import org.apache.cassandra.db.*;
-import org.apache.cassandra.db.rows.*;
-import org.apache.cassandra.db.partitions.*;
 import org.apache.cassandra.db.context.CounterContext;
 import org.apache.cassandra.db.filter.*;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.TimeUUIDType;
+import org.apache.cassandra.db.partitions.*;
+import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.dht.*;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.exceptions.*;
@@ -399,8 +402,13 @@ public class CassandraServer implements Cassandra.Iface
                     for (ByteBuffer bb : predicate.column_names)
                     {
                         LegacyLayout.LegacyCellName name = LegacyLayout.decodeCellName(metadata, parent.bufferForSuper_column(), bb);
-                        clusterings.add(name.clustering);
+
+                        if (!name.clustering.equals(Clustering.STATIC_CLUSTERING))
+                            clusterings.add(name.clustering);
                     }
+
+                    // clusterings cannot include STATIC_CLUSTERING, so if the names filter is for static columns, clusterings
+                    // will be empty.  However, by requesting the static columns in our ColumnFilter, this will still work.
                     return new ClusteringIndexNamesFilter(clusterings, false);
                 }
             }
@@ -492,12 +500,16 @@ public class CassandraServer implements Cassandra.Iface
                 }
                 else
                 {
-                    PartitionColumns.Builder builder = new PartitionColumns.Builder();
+                    PartitionColumns.Builder builder = PartitionColumns.builder();
                     for (ByteBuffer bb : predicate.column_names)
                     {
                         LegacyLayout.LegacyCellName name = LegacyLayout.decodeCellName(metadata, parent.bufferForSuper_column(), bb);
                         builder.add(name.column);
                     }
+
+                    if (metadata.isStaticCompactTable())
+                        builder.add(metadata.compactValueColumn());
+
                     return ColumnFilter.selection(builder.build());
                 }
             }
@@ -824,7 +836,10 @@ public class CassandraServer implements Cassandra.Iface
         {
             LegacyLayout.LegacyCellName name = LegacyLayout.decodeCellName(metadata, column_parent.super_column, column.name);
             Cell cell = cellFromColumn(metadata, name, column);
-            PartitionUpdate update = PartitionUpdate.singleRowUpdate(metadata, key, BTreeBackedRow.singleCellRow(name.clustering, cell));
+            PartitionUpdate update = PartitionUpdate.singleRowUpdate(metadata, key, BTreeRow.singleCellRow(name.clustering, cell));
+
+            // Indexed column values cannot be larger than 64K.  See CASSANDRA-3057/4240 for more details
+            Keyspace.open(metadata.ksName).getColumnFamilyStore(metadata.cfName).indexManager.validate(update);
 
             mutation = new org.apache.cassandra.db.Mutation(update);
         }
@@ -916,6 +931,8 @@ public class CassandraServer implements Cassandra.Iface
             int nowInSec = FBUtilities.nowInSeconds();
 
             PartitionUpdate partitionUpdates = PartitionUpdate.fromIterator(LegacyLayout.toRowIterator(metadata, dk, toLegacyCells(metadata, updates, nowInSec).iterator(), nowInSec));
+            // Indexed column values cannot be larger than 64K.  See CASSANDRA-3057/4240 for more details
+            Keyspace.open(metadata.ksName).getColumnFamilyStore(metadata.cfName).indexManager.validate(partitionUpdates);
 
             FilteredPartition partitionExpected = null;
             if (!expected.isEmpty())
@@ -1101,7 +1118,7 @@ public class CassandraServer implements Cassandra.Iface
                 if (metadata.isCounter())
                     ThriftConversion.fromThrift(consistency_level).validateCounterForWrite(metadata);
 
-                MutableDeletionInfo delInfo = MutableDeletionInfo.live();
+                LegacyLayout.LegacyDeletionInfo delInfo = LegacyLayout.LegacyDeletionInfo.live();
                 List<LegacyLayout.LegacyCell> cells = new ArrayList<>();
                 for (Mutation m : muts)
                 {
@@ -1120,6 +1137,9 @@ public class CassandraServer implements Cassandra.Iface
                 sortAndMerge(metadata, cells, nowInSec);
                 DecoratedKey dk = metadata.decorateKey(key);
                 PartitionUpdate update = PartitionUpdate.fromIterator(LegacyLayout.toUnfilteredRowIterator(metadata, dk, delInfo, cells.iterator()));
+
+                // Indexed column values cannot be larger than 64K.  See CASSANDRA-3057/4240 for more details
+                Keyspace.open(metadata.ksName).getColumnFamilyStore(metadata.cfName).indexManager.validate(update);
 
                 org.apache.cassandra.db.Mutation mutation;
                 if (metadata.isCounter())
@@ -1179,12 +1199,12 @@ public class CassandraServer implements Cassandra.Iface
         }
     }
 
-    private void addRange(CFMetaData cfm, MutableDeletionInfo delInfo, Slice.Bound start, Slice.Bound end, long timestamp, int nowInSec)
+    private void addRange(CFMetaData cfm, LegacyLayout.LegacyDeletionInfo delInfo, Slice.Bound start, Slice.Bound end, long timestamp, int nowInSec)
     {
-        delInfo.add(new RangeTombstone(Slice.make(start, end), new DeletionTime(timestamp, nowInSec)), cfm.comparator);
+        delInfo.add(cfm, new RangeTombstone(Slice.make(start, end), new DeletionTime(timestamp, nowInSec)));
     }
 
-    private void deleteColumnOrSuperColumn(MutableDeletionInfo delInfo, List<LegacyLayout.LegacyCell> cells, CFMetaData cfm, Deletion del, int nowInSec)
+    private void deleteColumnOrSuperColumn(LegacyLayout.LegacyDeletionInfo delInfo, List<LegacyLayout.LegacyCell> cells, CFMetaData cfm, Deletion del, int nowInSec)
     throws InvalidRequestException
     {
         if (del.predicate != null && del.predicate.column_names != null)
@@ -1210,12 +1230,9 @@ public class CassandraServer implements Cassandra.Iface
         {
             if (del.super_column == null)
             {
-                addRange(cfm,
-                         delInfo,
-                         LegacyLayout.decodeBound(cfm, del.predicate.getSlice_range().start, true).bound,
-                         LegacyLayout.decodeBound(cfm, del.predicate.getSlice_range().finish, false).bound,
-                         del.timestamp,
-                         nowInSec);
+                LegacyLayout.LegacyBound start = LegacyLayout.decodeBound(cfm, del.predicate.getSlice_range().start, true);
+                LegacyLayout.LegacyBound end = LegacyLayout.decodeBound(cfm, del.predicate.getSlice_range().finish, false);
+                delInfo.add(cfm, new LegacyLayout.LegacyRangeTombstone(start, end, new DeletionTime(del.timestamp, nowInSec)));
             }
             else
             {
@@ -1329,7 +1346,7 @@ public class CassandraServer implements Cassandra.Iface
         }
         else if (column_path.super_column != null && column_path.column == null)
         {
-            Row row = BTreeBackedRow.emptyDeletedRow(new Clustering(column_path.super_column), new DeletionTime(timestamp, nowInSec));
+            Row row = BTreeRow.emptyDeletedRow(new Clustering(column_path.super_column), new DeletionTime(timestamp, nowInSec));
             update = PartitionUpdate.singleRowUpdate(metadata, dk, row);
         }
         else
@@ -1339,7 +1356,7 @@ public class CassandraServer implements Cassandra.Iface
                 LegacyLayout.LegacyCellName name = LegacyLayout.decodeCellName(metadata, column_path.super_column, column_path.column);
                 CellPath path = name.collectionElement == null ? null : CellPath.create(name.collectionElement);
                 Cell cell = BufferCell.tombstone(name.column, timestamp, nowInSec, path);
-                update = PartitionUpdate.singleRowUpdate(metadata, dk, BTreeBackedRow.singleCellRow(name.clustering, cell));
+                update = PartitionUpdate.singleRowUpdate(metadata, dk, BTreeRow.singleCellRow(name.clustering, cell));
             }
             catch (UnknownColumnException e)
             {
@@ -1857,7 +1874,6 @@ public class CassandraServer implements Cassandra.Iface
             cf_def.unsetId(); // explicitly ignore any id set by client (Hector likes to set zero)
             CFMetaData cfm = ThriftConversion.fromThrift(cf_def);
             cfm.params.compaction.validate();
-            cfm.addDefaultIndexNames();
 
             if (!cfm.getTriggers().isEmpty())
                 state().ensureIsSuper("Only superusers are allowed to add triggers.");
@@ -1921,7 +1937,6 @@ public class CassandraServer implements Cassandra.Iface
             {
                 cf_def.unsetId(); // explicitly ignore any id set by client (same as system_add_column_family)
                 CFMetaData cfm = ThriftConversion.fromThrift(cf_def);
-                cfm.addDefaultIndexNames();
 
                 if (!cfm.getTriggers().isEmpty())
                     state().ensureIsSuper("Only superusers are allowed to add triggers.");
@@ -2007,7 +2022,6 @@ public class CassandraServer implements Cassandra.Iface
 
             CFMetaData cfm = ThriftConversion.fromThriftForUpdate(cf_def, oldCfm);
             cfm.params.compaction.validate();
-            cfm.addDefaultIndexNames();
 
             if (!oldCfm.getTriggers().equals(cfm.getTriggers()))
                 state().ensureIsSuper("Only superusers are allowed to add or remove triggers.");
@@ -2138,7 +2152,7 @@ public class CassandraServer implements Cassandra.Iface
                 CellPath path = name.collectionElement == null ? null : CellPath.create(name.collectionElement);
                 Cell cell = BufferCell.live(metadata, name.column, FBUtilities.timestampMicros(), value, path);
 
-                PartitionUpdate update = PartitionUpdate.singleRowUpdate(metadata, key, BTreeBackedRow.singleCellRow(name.clustering, cell));
+                PartitionUpdate update = PartitionUpdate.singleRowUpdate(metadata, key, BTreeRow.singleCellRow(name.clustering, cell));
 
                 org.apache.cassandra.db.Mutation mutation = new org.apache.cassandra.db.Mutation(update);
                 doInsert(consistency_level, Arrays.asList(new CounterMutation(mutation, ThriftConversion.fromThrift(consistency_level))));

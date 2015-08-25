@@ -19,11 +19,13 @@ package org.apache.cassandra.schema;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
+import java.util.stream.Collectors;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.MapDifference;
@@ -36,7 +38,6 @@ import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.cql3.functions.*;
-import org.apache.cassandra.db.ClusteringComparator;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.marshal.*;
 import org.apache.cassandra.db.partitions.*;
@@ -48,8 +49,6 @@ import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.concurrent.OpOrder;
 
 import static org.apache.cassandra.cql3.QueryProcessor.executeOnceInternal;
-import static org.apache.cassandra.utils.FBUtilities.fromJsonMap;
-import static org.apache.cassandra.utils.FBUtilities.json;
 
 /**
  * system_schema.* tables and methods for manipulating them.
@@ -73,9 +72,10 @@ public final class SchemaKeyspace
     public static final String TYPES = "types";
     public static final String FUNCTIONS = "functions";
     public static final String AGGREGATES = "aggregates";
+    public static final String INDEXES = "indexes";
 
     public static final List<String> ALL =
-        ImmutableList.of(KEYSPACES, TABLES, COLUMNS, TRIGGERS, MATERIALIZED_VIEWS, TYPES, FUNCTIONS, AGGREGATES);
+        ImmutableList.of(KEYSPACES, TABLES, COLUMNS, TRIGGERS, MATERIALIZED_VIEWS, TYPES, FUNCTIONS, AGGREGATES, INDEXES);
 
     private static final CFMetaData Keyspaces =
         compile(KEYSPACES,
@@ -83,7 +83,7 @@ public final class SchemaKeyspace
                 "CREATE TABLE %s ("
                 + "keyspace_name text,"
                 + "durable_writes boolean,"
-                + "replication map<text, text>,"
+                + "replication frozen<map<text, text>>,"
                 + "PRIMARY KEY ((keyspace_name)))");
 
     private static final CFMetaData Tables =
@@ -93,13 +93,14 @@ public final class SchemaKeyspace
                 + "keyspace_name text,"
                 + "table_name text,"
                 + "bloom_filter_fp_chance double,"
-                + "caching map<text, text>,"
+                + "caching frozen<map<text, text>>,"
                 + "comment text,"
-                + "compaction map<text, text>,"
-                + "compression map<text, text>,"
+                + "compaction frozen<map<text, text>>,"
+                + "compression frozen<map<text, text>>,"
                 + "dclocal_read_repair_chance double,"
                 + "default_time_to_live int,"
-                + "flags set<text>," // SUPER, COUNTER, DENSE, COMPOUND
+                + "extensions frozen<map<text, blob>>,"
+                + "flags frozen<set<text>>," // SUPER, COUNTER, DENSE, COMPOUND
                 + "gc_grace_seconds int,"
                 + "id uuid,"
                 + "max_index_interval int,"
@@ -118,9 +119,6 @@ public final class SchemaKeyspace
                 + "column_name text,"
                 + "column_name_bytes blob,"
                 + "component_index int,"
-                + "index_name text,"
-                + "index_options text,"
-                + "index_type text,"
                 + "type text,"
                 + "validator text,"
                 + "PRIMARY KEY ((keyspace_name), table_name, column_name))");
@@ -143,7 +141,7 @@ public final class SchemaKeyspace
                 + "keyspace_name text,"
                 + "table_name text,"
                 + "trigger_name text,"
-                + "trigger_options map<text, text>,"
+                + "trigger_options frozen<map<text, text>>,"
                 + "PRIMARY KEY ((keyspace_name), table_name, trigger_name))");
 
     private static final CFMetaData MaterializedViews =
@@ -153,10 +151,23 @@ public final class SchemaKeyspace
                 + "keyspace_name text,"
                 + "table_name text,"
                 + "view_name text,"
-                + "target_columns list<text>,"
-                + "clustering_columns list<text>,"
-                + "included_columns list<text>,"
+                + "target_columns frozen<list<text>>,"
+                + "clustering_columns frozen<list<text>>,"
+                + "included_columns frozen<list<text>>,"
                 + "PRIMARY KEY ((keyspace_name), table_name, view_name))");
+
+    private static final CFMetaData Indexes =
+        compile(INDEXES,
+                "secondary index definitions",
+                "CREATE TABLE %s ("
+                + "keyspace_name text,"
+                + "table_name text,"
+                + "index_name text,"
+                + "index_type text,"
+                + "options frozen<map<text, text>>,"
+                + "target_columns frozen<set<text>>,"
+                + "target_type text,"
+                + "PRIMARY KEY ((keyspace_name), table_name, index_name))");
 
     private static final CFMetaData Types =
         compile(TYPES,
@@ -164,8 +175,8 @@ public final class SchemaKeyspace
                 "CREATE TABLE %s ("
                 + "keyspace_name text,"
                 + "type_name text,"
-                + "field_names list<text>,"
-                + "field_types list<text>,"
+                + "field_names frozen<list<text>>,"
+                + "field_types frozen<list<text>>,"
                 + "PRIMARY KEY ((keyspace_name), type_name))");
 
     private static final CFMetaData Functions =
@@ -175,8 +186,8 @@ public final class SchemaKeyspace
                 + "keyspace_name text,"
                 + "function_name text,"
                 + "signature frozen<list<text>>,"
-                + "argument_names list<text>,"
-                + "argument_types list<text>,"
+                + "argument_names frozen<list<text>>,"
+                + "argument_types frozen<list<text>>,"
                 + "body text,"
                 + "language text,"
                 + "return_type text,"
@@ -190,7 +201,7 @@ public final class SchemaKeyspace
                 + "keyspace_name text,"
                 + "aggregate_name text,"
                 + "signature frozen<list<text>>,"
-                + "argument_types list<text>,"
+                + "argument_types frozen<list<text>>,"
                 + "final_func text,"
                 + "initcond blob,"
                 + "return_type text,"
@@ -198,8 +209,8 @@ public final class SchemaKeyspace
                 + "state_type text,"
                 + "PRIMARY KEY ((keyspace_name), aggregate_name, signature))");
 
-    public static final List<CFMetaData> All =
-        ImmutableList.of(Keyspaces, Tables, Columns, Triggers, DroppedColumns, MaterializedViews, Types, Functions, Aggregates);
+    public static final List<CFMetaData> ALL_TABLE_METADATA =
+        ImmutableList.of(Keyspaces, Tables, Columns, Triggers, DroppedColumns, MaterializedViews, Types, Functions, Aggregates, Indexes);
 
     private static CFMetaData compile(String name, String description, String schema)
     {
@@ -210,7 +221,7 @@ public final class SchemaKeyspace
 
     public static KeyspaceMetadata metadata()
     {
-        return KeyspaceMetadata.create(NAME, KeyspaceParams.local(), org.apache.cassandra.schema.Tables.of(All));
+        return KeyspaceMetadata.create(NAME, KeyspaceParams.local(), org.apache.cassandra.schema.Tables.of(ALL_TABLE_METADATA));
     }
 
     /**
@@ -677,7 +688,7 @@ public final class SchemaKeyspace
     {
         RowUpdateBuilder adder = new RowUpdateBuilder(Keyspaces, timestamp, name).clustering();
         return adder.add(KeyspaceParams.Option.DURABLE_WRITES.toString(), params.durableWrites)
-                    .map(KeyspaceParams.Option.REPLICATION.toString(), params.replication.asMap())
+                    .frozenMap(KeyspaceParams.Option.REPLICATION.toString(), params.replication.asMap())
                     .build();
     }
 
@@ -698,7 +709,7 @@ public final class SchemaKeyspace
         int nowInSec = FBUtilities.nowInSeconds();
         Mutation mutation = new Mutation(NAME, Keyspaces.decorateKey(getSchemaKSKey(keyspace.name)));
 
-        for (CFMetaData schemaTable : All)
+        for (CFMetaData schemaTable : ALL_TABLE_METADATA)
             mutation.add(PartitionUpdate.fullPartitionDelete(schemaTable, mutation.key(), timestamp, nowInSec));
 
         return mutation;
@@ -735,7 +746,7 @@ public final class SchemaKeyspace
         UntypedResultSet.Row row = QueryProcessor.resultify(query, partition).one();
 
         return KeyspaceParams.create(row.getBoolean(KeyspaceParams.Option.DURABLE_WRITES.toString()),
-                                     row.getTextMap(KeyspaceParams.Option.REPLICATION.toString()));
+                                     row.getFrozenTextMap(KeyspaceParams.Option.REPLICATION.toString()));
     }
 
     /*
@@ -753,18 +764,23 @@ public final class SchemaKeyspace
     static void addTypeToSchemaMutation(UserType type, long timestamp, Mutation mutation)
     {
         RowUpdateBuilder adder = new RowUpdateBuilder(Types, timestamp, mutation)
-                                 .clustering(type.getNameAsString());
-
-        adder.resetCollection("field_names")
-             .resetCollection("field_types");
-
-        for (int i = 0; i < type.size(); i++)
-        {
-            adder.addListEntry("field_names", type.fieldName(i))
-                 .addListEntry("field_types", type.fieldType(i).toString());
-        }
+                                 .clustering(type.getNameAsString())
+                                 .frozenList("field_names", type.fieldNames().stream().map(SchemaKeyspace::bbToString).collect(Collectors.toList()))
+                                 .frozenList("field_types", type.fieldTypes().stream().map(AbstractType::toString).collect(Collectors.toList()));
 
         adder.build();
+    }
+
+    private static String bbToString(ByteBuffer bb)
+    {
+        try
+        {
+            return ByteBufferUtil.string(bb);
+        }
+        catch (CharacterCodingException e)
+        {
+            throw new RuntimeException(e);
+        }
     }
 
     public static Mutation dropTypeFromSchemaMutation(KeyspaceMetadata keyspace, UserType type, long timestamp)
@@ -786,8 +802,8 @@ public final class SchemaKeyspace
     {
         String keyspace = row.getString("keyspace_name");
         ByteBuffer name = ByteBufferUtil.bytes(row.getString("type_name"));
-        List<String> rawColumns = row.getList("field_names", UTF8Type.instance);
-        List<String> rawTypes = row.getList("field_types", UTF8Type.instance);
+        List<String> rawColumns = row.getFrozenList("field_names", UTF8Type.instance);
+        List<String> rawTypes = row.getFrozenList("field_types", UTF8Type.instance);
 
         List<ByteBuffer> columns = new ArrayList<>(rawColumns.size());
         for (String rawColumn : rawColumns)
@@ -819,7 +835,7 @@ public final class SchemaKeyspace
         addTableParamsToSchemaMutation(table.params, adder);
 
         adder.add("id", table.cfId)
-             .set("flags", CFMetaData.flagsToStrings(table.flags()))
+             .frozenSet("flags", CFMetaData.flagsToStrings(table.flags()))
              .build();
 
         if (withColumnsAndTriggers)
@@ -835,6 +851,9 @@ public final class SchemaKeyspace
 
             for (MaterializedViewDefinition materializedView: table.getMaterializedViews())
                 addMaterializedViewToSchemaMutation(table, materializedView, timestamp, mutation);
+
+            for (IndexMetadata index : table.getIndexes())
+                addIndexToSchemaMutation(table, index, timestamp, mutation);
         }
     }
 
@@ -850,9 +869,10 @@ public final class SchemaKeyspace
              .add("min_index_interval", params.minIndexInterval)
              .add("read_repair_chance", params.readRepairChance)
              .add("speculative_retry", params.speculativeRetry.toString())
-             .map("caching", params.caching.asMap())
-             .map("compaction", params.compaction.asMap())
-             .map("compression", params.compression.asMap());
+             .frozenMap("caching", params.caching.asMap())
+             .frozenMap("compaction", params.compaction.asMap())
+             .frozenMap("compression", params.compression.asMap())
+             .frozenMap("extensions", params.extensions);
     }
 
     public static Mutation makeUpdateTableMutation(KeyspaceMetadata keyspace,
@@ -919,15 +939,43 @@ public final class SchemaKeyspace
 
         // newly created materialized views
         for (MaterializedViewDefinition materializedView : materializedViewDiff.entriesOnlyOnRight().values())
-            addMaterializedViewToSchemaMutation(oldTable, materializedView, timestamp, mutation);
+            addMaterializedViewToSchemaMutation(newTable, materializedView, timestamp, mutation);
 
         // updated materialized views need to be updated
         for (MapDifference.ValueDifference<MaterializedViewDefinition> diff : materializedViewDiff.entriesDiffering().values())
         {
-            addUpdatedMaterializedViewDefinitionToSchemaMutation(oldTable, diff.rightValue(), timestamp, mutation);
+            addUpdatedMaterializedViewDefinitionToSchemaMutation(newTable, diff.rightValue(), timestamp, mutation);
+        }
+
+        MapDifference<String, IndexMetadata> indexesDiff = indexesDiff(oldTable.getIndexes(),
+                                                                       newTable.getIndexes());
+
+        // dropped indexes
+        for (IndexMetadata index : indexesDiff.entriesOnlyOnLeft().values())
+            dropIndexFromSchemaMutation(oldTable, index, timestamp, mutation);
+
+        // newly created indexes
+        for (IndexMetadata index : indexesDiff.entriesOnlyOnRight().values())
+            addIndexToSchemaMutation(newTable, index, timestamp, mutation);
+
+        // updated indexes need to be updated
+        for (MapDifference.ValueDifference<IndexMetadata> diff : indexesDiff.entriesDiffering().values())
+        {
+            addUpdatedIndexToSchemaMutation(newTable, diff.rightValue(), timestamp, mutation);
         }
 
         return mutation;
+    }
+
+    private static MapDifference<String, IndexMetadata> indexesDiff(Indexes before, Indexes after)
+    {
+        Map<String, IndexMetadata> beforeMap = new HashMap<>();
+        before.forEach(i -> beforeMap.put(i.name, i));
+
+        Map<String, IndexMetadata> afterMap = new HashMap<>();
+        after.forEach(i -> afterMap.put(i.name, i));
+
+        return Maps.difference(beforeMap, afterMap);
     }
 
     private static MapDifference<String, TriggerMetadata> triggersDiff(Triggers before, Triggers after)
@@ -967,6 +1015,9 @@ public final class SchemaKeyspace
 
         for (MaterializedViewDefinition materializedView : table.getMaterializedViews())
             dropMaterializedViewFromSchemaMutation(table, materializedView, timestamp, mutation);
+
+        for (IndexMetadata index : table.getIndexes())
+            dropIndexFromSchemaMutation(table, index, timestamp, mutation);
 
         return mutation;
     }
@@ -1035,9 +1086,18 @@ public final class SchemaKeyspace
         MaterializedViews views =
             readSchemaPartitionForTableAndApply(MATERIALIZED_VIEWS, keyspace, table, SchemaKeyspace::createMaterializedViewsFromMaterializedViewsPartition);
 
-        return createTableFromTableRowAndColumns(row, columns).droppedColumns(droppedColumns)
-                                                              .triggers(triggers)
-                                                              .materializedViews(views);
+        CFMetaData cfm = createTableFromTableRowAndColumns(row, columns).droppedColumns(droppedColumns)
+                                                                        .triggers(triggers)
+                                                                        .materializedViews(views);
+
+        // the CFMetaData itself is required to build the collection of indexes as
+        // the column definitions are needed because we store only the name each
+        // index's target columns and this is not enough to reconstruct a ColumnIdentifier
+        org.apache.cassandra.schema.Indexes indexes =
+            readSchemaPartitionForTableAndApply(INDEXES, keyspace, table, rowIterator -> createIndexesFromIndexesPartition(cfm, rowIterator));
+        cfm.indexes(indexes);
+
+        return cfm;
     }
 
     public static CFMetaData createTableFromTableRowAndColumns(UntypedResultSet.Row row, List<ColumnDefinition> columns)
@@ -1047,7 +1107,7 @@ public final class SchemaKeyspace
         UUID id = row.getUUID("id");
 
         Set<CFMetaData.Flag> flags = row.has("flags")
-                                   ? CFMetaData.flagsFromStrings(row.getSet("flags", UTF8Type.instance))
+                                   ? CFMetaData.flagsFromStrings(row.getFrozenSet("flags", UTF8Type.instance))
                                    : Collections.emptySet();
 
         boolean isSuper = flags.contains(CFMetaData.Flag.SUPER);
@@ -1071,21 +1131,26 @@ public final class SchemaKeyspace
 
     private static TableParams createTableParamsFromRow(UntypedResultSet.Row row)
     {
-        return TableParams.builder()
-                          .bloomFilterFpChance(row.getDouble("bloom_filter_fp_chance"))
-                          .caching(CachingParams.fromMap(row.getTextMap("caching")))
-                          .comment(row.getString("comment"))
-                          .compaction(CompactionParams.fromMap(row.getTextMap("compaction")))
-                          .compression(CompressionParams.fromMap(row.getTextMap("compression")))
-                          .dcLocalReadRepairChance(row.getDouble("dclocal_read_repair_chance"))
-                          .defaultTimeToLive(row.getInt("default_time_to_live"))
-                          .gcGraceSeconds(row.getInt("gc_grace_seconds"))
-                          .maxIndexInterval(row.getInt("max_index_interval"))
-                          .memtableFlushPeriodInMs(row.getInt("memtable_flush_period_in_ms"))
-                          .minIndexInterval(row.getInt("min_index_interval"))
-                          .readRepairChance(row.getDouble("read_repair_chance"))
-                          .speculativeRetry(SpeculativeRetryParam.fromString(row.getString("speculative_retry")))
-                          .build();
+        TableParams.Builder builder = TableParams.builder();
+
+        builder.bloomFilterFpChance(row.getDouble("bloom_filter_fp_chance"))
+               .caching(CachingParams.fromMap(row.getFrozenTextMap("caching")))
+               .comment(row.getString("comment"))
+               .compaction(CompactionParams.fromMap(row.getFrozenTextMap("compaction")))
+               .compression(CompressionParams.fromMap(row.getFrozenTextMap("compression")))
+               .dcLocalReadRepairChance(row.getDouble("dclocal_read_repair_chance"))
+               .defaultTimeToLive(row.getInt("default_time_to_live"))
+               .gcGraceSeconds(row.getInt("gc_grace_seconds"))
+               .maxIndexInterval(row.getInt("max_index_interval"))
+               .memtableFlushPeriodInMs(row.getInt("memtable_flush_period_in_ms"))
+               .minIndexInterval(row.getInt("min_index_interval"))
+               .readRepairChance(row.getDouble("read_repair_chance"))
+               .speculativeRetry(SpeculativeRetryParam.fromString(row.getString("speculative_retry")));
+
+        if (row.has("extensions"))
+            builder.extensions(row.getFrozenMap("extensions", UTF8Type.instance, BytesType.instance));
+
+        return builder.build();
     }
 
     /*
@@ -1100,9 +1165,6 @@ public final class SchemaKeyspace
              .add("validator", column.type.toString())
              .add("type", column.kind.toString().toLowerCase())
              .add("component_index", column.isOnAllComponents() ? null : column.position())
-             .add("index_name", column.getIndexName())
-             .add("index_type", column.getIndexType() == null ? null : column.getIndexType().toString())
-             .add("index_options", json(column.getIndexOptions()))
              .build();
     }
 
@@ -1134,19 +1196,7 @@ public final class SchemaKeyspace
 
         AbstractType<?> validator = parseType(row.getString("validator"));
 
-        IndexType indexType = null;
-        if (row.has("index_type"))
-            indexType = IndexType.valueOf(row.getString("index_type"));
-
-        Map<String, String> indexOptions = null;
-        if (row.has("index_options"))
-            indexOptions = fromJsonMap(row.getString("index_options"));
-
-        String indexName = null;
-        if (row.has("index_name"))
-            indexName = row.getString("index_name");
-
-        return new ColumnDefinition(keyspace, table, name, validator, indexType, indexOptions, indexName, componentIndex, kind);
+        return new ColumnDefinition(keyspace, table, name, validator, componentIndex, kind);
     }
 
     /*
@@ -1195,7 +1245,7 @@ public final class SchemaKeyspace
     {
         new RowUpdateBuilder(Triggers, timestamp, mutation)
             .clustering(table.cfName, trigger.name)
-            .addMapEntry("trigger_options", "class", trigger.classOption)
+            .frozenMap("trigger_options", Collections.singletonMap("class", trigger.classOption))
             .build();
     }
 
@@ -1221,12 +1271,12 @@ public final class SchemaKeyspace
     private static TriggerMetadata createTriggerFromTriggerRow(UntypedResultSet.Row row)
     {
         String name = row.getString("trigger_name");
-        String classOption = row.getTextMap("trigger_options").get("class");
+        String classOption = row.getFrozenTextMap("trigger_options").get("class");
         return new TriggerMetadata(name, classOption);
     }
 
     /*
-     * Global Index metadata serialization/deserialization.
+     * Materialized View metadata serialization/deserialization.
      */
 
     private static void addMaterializedViewToSchemaMutation(CFMetaData table, MaterializedViewDefinition materializedView, long timestamp, Mutation mutation)
@@ -1234,12 +1284,9 @@ public final class SchemaKeyspace
         RowUpdateBuilder builder = new RowUpdateBuilder(MaterializedViews, timestamp, mutation)
             .clustering(table.cfName, materializedView.viewName);
 
-        for (ColumnIdentifier partitionColumn : materializedView.partitionColumns)
-            builder.addListEntry("target_columns", partitionColumn.toString());
-        for (ColumnIdentifier clusteringColumn : materializedView.clusteringColumns)
-            builder = builder.addListEntry("clustering_columns", clusteringColumn.toString());
-        for (ColumnIdentifier includedColumn : materializedView.included)
-            builder = builder.addListEntry("included_columns", includedColumn.toString());
+        builder.frozenList("target_columns", materializedView.partitionColumns.stream().map(ColumnIdentifier::toString).collect(Collectors.toList()));
+        builder.frozenList("clustering_columns", materializedView.clusteringColumns.stream().map(ColumnIdentifier::toString).collect(Collectors.toList()));
+        builder.frozenList("included_columns", materializedView.included.stream().map(ColumnIdentifier::toString).collect(Collectors.toList()));
 
         builder.build();
     }
@@ -1251,22 +1298,7 @@ public final class SchemaKeyspace
 
     private static void addUpdatedMaterializedViewDefinitionToSchemaMutation(CFMetaData table, MaterializedViewDefinition materializedView, long timestamp, Mutation mutation)
     {
-        RowUpdateBuilder builder = new RowUpdateBuilder(MaterializedViews, timestamp, mutation)
-                                   .clustering(table.cfName, materializedView.viewName);
-
-        builder.resetCollection("target_columns");
-        for (ColumnIdentifier partitionColumn : materializedView.partitionColumns)
-            builder.addListEntry("target_columns", partitionColumn.toString());
-
-        builder.resetCollection("clustering_columns");
-        for (ColumnIdentifier clusteringColumn : materializedView.clusteringColumns)
-            builder = builder.addListEntry("clustering_columns", clusteringColumn.toString());
-
-        builder.resetCollection("included_columns");
-        for (ColumnIdentifier includedColumn : materializedView.included)
-            builder = builder.addListEntry("included_columns", includedColumn.toString());
-
-        builder.build();
+        addMaterializedViewToSchemaMutation(table, materializedView, timestamp, mutation);
     }
 
     /**
@@ -1290,10 +1322,10 @@ public final class SchemaKeyspace
     private static MaterializedViewDefinition createMaterializedViewFromMaterializedViewRow(UntypedResultSet.Row row)
     {
         String name = row.getString("view_name");
-        List<String> partitionColumnNames = row.getList("target_columns", UTF8Type.instance);
+        List<String> partitionColumnNames = row.getFrozenList("target_columns", UTF8Type.instance);
 
         String cfName = row.getString("table_name");
-        List<String> clusteringColumnNames = row.getList("clustering_columns", UTF8Type.instance);
+        List<String> clusteringColumnNames = row.getFrozenList("clustering_columns", UTF8Type.instance);
 
         List<ColumnIdentifier> partitionColumns = new ArrayList<>();
         for (String columnName : partitionColumnNames)
@@ -1307,7 +1339,7 @@ public final class SchemaKeyspace
             clusteringColumns.add(ColumnIdentifier.getInterned(columnName, true));
         }
 
-        List<String> includedColumnNames = row.getList("included_columns", UTF8Type.instance);
+        List<String> includedColumnNames = row.getFrozenList("included_columns", UTF8Type.instance);
         Set<ColumnIdentifier> includedColumns = new HashSet<>();
         if (includedColumnNames != null)
         {
@@ -1320,6 +1352,91 @@ public final class SchemaKeyspace
                                               partitionColumns,
                                               clusteringColumns,
                                               includedColumns);
+    }
+
+    /*
+     * Secondary Index metadata serialization/deserialization.
+     */
+
+    private static void addIndexToSchemaMutation(CFMetaData table,
+                                                 IndexMetadata index,
+                                                 long timestamp,
+                                                 Mutation mutation)
+    {
+        RowUpdateBuilder builder = new RowUpdateBuilder(Indexes, timestamp, mutation).clustering(table.cfName, index.name);
+
+        builder.add("index_type", index.indexType.toString());
+        builder.frozenMap("options", index.options);
+        builder.frozenSet("target_columns", index.columns.stream().map(ColumnIdentifier::toString).collect(Collectors.toSet()));
+        builder.add("target_type", index.targetType.toString());
+        builder.build();
+    }
+
+    private static void dropIndexFromSchemaMutation(CFMetaData table,
+                                                    IndexMetadata index,
+                                                    long timestamp,
+                                                    Mutation mutation)
+    {
+        RowUpdateBuilder.deleteRow(Indexes, timestamp, mutation, table.cfName, index.name);
+    }
+
+    private static void addUpdatedIndexToSchemaMutation(CFMetaData table,
+                                                        IndexMetadata index,
+                                                        long timestamp,
+                                                        Mutation mutation)
+    {
+        addIndexToSchemaMutation(table, index, timestamp, mutation);
+    }
+    /**
+     * Deserialize secondary indexes from storage-level representation.
+     *
+     * @param partition storage-level partition containing the index definitions
+     * @return the list of processed IndexMetadata
+     */
+    private static Indexes createIndexesFromIndexesPartition(CFMetaData cfm, RowIterator partition)
+    {
+        Indexes.Builder indexes = org.apache.cassandra.schema.Indexes.builder();
+        String query = String.format("SELECT * FROM %s.%s", NAME, INDEXES);
+        QueryProcessor.resultify(query, partition).forEach(row -> indexes.add(createIndexMetadataFromIndexesRow(cfm, row)));
+        return indexes.build();
+    }
+
+    private static IndexMetadata createIndexMetadataFromIndexesRow(CFMetaData cfm, UntypedResultSet.Row row)
+    {
+        String name = row.getString("index_name");
+        IndexMetadata.IndexType type = IndexMetadata.IndexType.valueOf(row.getString("index_type"));
+        IndexMetadata.TargetType targetType = IndexMetadata.TargetType.valueOf(row.getString("target_type"));
+        Map<String, String> options = row.getFrozenTextMap("options");
+        if (options == null)
+            options = Collections.emptyMap();
+
+        Set<String> targetColumnNames = row.getFrozenSet("target_columns", UTF8Type.instance);
+        assert targetType == IndexMetadata.TargetType.COLUMN : "Per row indexes with dynamic target columns are not supported yet";
+
+        Set<ColumnIdentifier> targetColumns = new HashSet<>();
+        // if it's not a CQL table, we can't assume that the column name is utf8, so
+        // in that case we have to do a linear scan of the cfm's columns to get the matching one
+        if (targetColumnNames != null)
+        {
+            assert targetColumnNames.size() == 1 : "Secondary indexes targetting multiple columns are not supported yet";
+            targetColumnNames.forEach(targetColumnName -> {
+                if (cfm.isCQLTable())
+                    targetColumns.add(ColumnIdentifier.getInterned(targetColumnName, true));
+                else
+                    findColumnIdentifierWithName(targetColumnName, cfm.allColumns()).ifPresent(targetColumns::add);
+            });
+        }
+        return IndexMetadata.singleColumnIndex(targetColumns.iterator().next(), name, type, options);
+    }
+
+    private static Optional<ColumnIdentifier> findColumnIdentifierWithName(String name,
+                                                                           Iterable<ColumnDefinition> columns)
+    {
+        for (ColumnDefinition column : columns)
+            if (column.name.toString().equals(name))
+                return Optional.of(column.name);
+
+        return Optional.empty();
     }
 
     /*
@@ -1342,16 +1459,9 @@ public final class SchemaKeyspace
         adder.add("body", function.body())
              .add("language", function.language())
              .add("return_type", function.returnType().toString())
-             .add("called_on_null_input", function.isCalledOnNullInput());
-
-        adder.resetCollection("argument_names")
-             .resetCollection("argument_types");
-
-        for (int i = 0; i < function.argNames().size(); i++)
-        {
-            adder.addListEntry("argument_names", function.argNames().get(i).bytes);
-            adder.addListEntry("argument_types", function.argTypes().get(i).toString());
-        }
+             .add("called_on_null_input", function.isCalledOnNullInput())
+             .frozenList("argument_names", function.argNames().stream().map((c) -> bbToString(c.bytes)).collect(Collectors.toList()))
+             .frozenList("argument_types", function.argTypes().stream().map(AbstractType::toString).collect(Collectors.toList()));
 
         adder.build();
     }
@@ -1380,12 +1490,12 @@ public final class SchemaKeyspace
 
         List<ColumnIdentifier> argNames = new ArrayList<>();
         if (row.has("argument_names"))
-            for (String arg : row.getList("argument_names", UTF8Type.instance))
+            for (String arg : row.getFrozenList("argument_names", UTF8Type.instance))
                 argNames.add(new ColumnIdentifier(arg, true));
 
         List<AbstractType<?>> argTypes = new ArrayList<>();
         if (row.has("argument_types"))
-            for (String type : row.getList("argument_types", UTF8Type.instance))
+            for (String type : row.getFrozenList("argument_types", UTF8Type.instance))
                 argTypes.add(parseType(type));
 
         AbstractType<?> returnType = parseType(row.getString("return_type"));
@@ -1442,22 +1552,13 @@ public final class SchemaKeyspace
         RowUpdateBuilder adder = new RowUpdateBuilder(Aggregates, timestamp, mutation)
                                  .clustering(aggregate.name().name, functionSignatureWithTypes(aggregate));
 
-        adder.resetCollection("argument_types");
-
         adder.add("return_type", aggregate.returnType().toString())
-             .add("state_func", aggregate.stateFunction().name().name);
-
-        if (aggregate.stateType() != null)
-            adder.add("state_type", aggregate.stateType().toString());
-        if (aggregate.finalFunction() != null)
-            adder.add("final_func", aggregate.finalFunction().name().name);
-        if (aggregate.initialCondition() != null)
-            adder.add("initcond", aggregate.initialCondition());
-
-        for (AbstractType<?> argType : aggregate.argTypes())
-            adder.addListEntry("argument_types", argType.toString());
-
-        adder.build();
+             .add("state_func", aggregate.stateFunction().name().name)
+             .add("state_type", aggregate.stateType() != null ? aggregate.stateType().toString() : null)
+             .add("final_func", aggregate.finalFunction() != null ? aggregate.finalFunction().name().name : null)
+             .add("initcond", aggregate.initialCondition())
+             .frozenList("argument_types", aggregate.argTypes().stream().map(AbstractType::toString).collect(Collectors.toList()))
+             .build();
     }
 
     private static Collection<UDAggregate> createAggregatesFromAggregatesPartition(RowIterator partition)
@@ -1475,7 +1576,7 @@ public final class SchemaKeyspace
         String functionName = row.getString("aggregate_name");
         FunctionName name = new FunctionName(ksName, functionName);
 
-        List<String> types = row.getList("argument_types", UTF8Type.instance);
+        List<String> types = row.getFrozenList("argument_types", UTF8Type.instance);
 
         List<AbstractType<?>> argTypes;
         if (types == null)

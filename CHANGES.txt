@@ -2,7 +2,27 @@
  * Add transparent data encryption core classes (CASSANDRA-9945)
 
 
+3.0.0-beta2
+ * Fix incorrect handling of range tombstones in thrift (CASSANDRA-10046)
+ * Only use batchlog when paired materialized view replica is remote (CASSANDRA-10061)
+ * Reuse TemporalRow when updating multiple MaterializedViews (CASSANDRA-10060)
+ * Validate gc_grace_seconds for batchlog writes and MVs (CASSANDRA-9917)
+ * Fix sstablerepairedset (CASSANDRA-10132)
+Merged from 2.2:
+ * (cqlsh) default load-from-file encoding to utf-8 (CASSANDRA-9898)
+ * Avoid returning Permission.NONE when failing to query users table (CASSANDRA-10168)
+ * (cqlsh) add CLEAR command (CASSANDRA-10086)
+ * Support string literals as Role names for compatibility (CASSANDRA-10135)
+Merged from 2.1:
+ * (cqlsh) update list of CQL keywords (CASSANDRA-9232)
+
+
 3.0.0-beta1
+ * Redesign secondary index API (CASSANDRA-9459, 7771, 9041)
+ * Fix throwing ReadFailure instead of ReadTimeout on range queries (CASSANDRA-10125)
+ * Rewrite hinted handoff (CASSANDRA-6230)
+ * Fix query on static compact tables (CASSANDRA-10093)
+ * Fix race during construction of commit log (CASSANDRA-10049)
  * Add option to only purge repaired tombstones (CASSANDRA-6434)
  * Change authorization handling for MVs (CASSANDRA-9927)
  * Add custom JMX enabled executor for UDF sandbox (CASSANDRA-10026)
@@ -17,10 +37,19 @@
  * Use byte to serialize MT hash length (CASSANDRA-9792)
  * Replace usage of Adler32 with CRC32 (CASSANDRA-8684)
  * Fix migration to new format from 2.1 SSTable (CASSANDRA-10006)
+ * SequentialWriter should extend BufferedDataOutputStreamPlus (CASSANDRA-9500)
+ * Use the same repairedAt timestamp within incremental repair session (CASSANDRA-9111)
 Merged from 2.2:
+ * Allow count(*) and count(1) to be use as normal aggregation (CASSANDRA-10114)
+ * An NPE is thrown if the column name is unknown for an IN relation (CASSANDRA-10043)
+ * Apply commit_failure_policy to more errors on startup (CASSANDRA-9749)
+ * Fix histogram overflow exception (CASSANDRA-9973)
+ * Route gossip messages over dedicated socket (CASSANDRA-9237)
  * Add checksum to saved cache files (CASSANDRA-9265)
  * Log warning when using an aggregate without partition key (CASSANDRA-9737)
 Merged from 2.1:
+ * (cqlsh) Allow encoding to be set through command line (CASSANDRA-10004)
+ * Add new JMX methods to change local compaction strategy (CASSANDRA-9965)
  * Write hints for paxos commits (CASSANDRA-7342)
  * (cqlsh) Fix timestamps before 1970 on Windows, always
    use UTC for timestamp display (CASSANDRA-10000)
@@ -30,6 +59,7 @@ Merged from 2.1:
  * Cannot replace token does not exist - DN node removed as Fat Client (CASSANDRA-9871)
 Merged from 2.0:
  * Don't cast expected bf size to an int (CASSANDRA-9959)
+ * Make getFullyExpiredSSTables less expensive (CASSANDRA-9882)
 
 
 3.0.0-alpha1

@@ -25,7 +25,7 @@
     <property name="debuglevel" value="source,lines,vars"/>
 
     <!-- default version and SCM information -->
-    <property name="base.version" value="3.0.0-alpha1"/>
+    <property name="base.version" value="3.0.0-beta1"/>
     <property name="scm.connection" value="scm:git://git.apache.org/cassandra.git"/>
     <property name="scm.developerConnection" value="scm:git://git.apache.org/cassandra.git"/>
     <property name="scm.url" value="http://git-wip-us.apache.org/repos/asf?p=cassandra.git;a=tree"/>
@@ -135,13 +135,11 @@
     <!-- Check if all tests are being run or just one. If it's all tests don't spam the console with test output.
          If it's an individual test print the output from the test under the assumption someone is debugging the test
          and wants to know what is going on without having to context switch to the log file that is generated.
-         This may be overridden when running a single test by adding the -Dtest.brief.output property to the ant
-         command (its value is unimportant).
          Debug level output still needs to be retrieved from the log file.  -->
     <script language="javascript">
         if (project.getProperty("cassandra.keepBriefBrief") == null)
         {
-            if (project.getProperty("test.name").equals("*Test") || project.getProperty("test.brief.output"))
+            if (project.getProperty("test.name").equals("*Test"))
                 project.setProperty("cassandra.keepBriefBrief", "true");
             else
                 project.setProperty("cassandra.keepBriefBrief", "false");
@@ -524,7 +522,7 @@
                 artifactId="cassandra-parent"
                 version="${version}"/>
         <!-- do NOT remove this, it breaks pig-test -->
-        <dependency groupId="joda-time" artifactId="joda-time" version="2.4" />
+        <dependency groupId="joda-time" artifactId="joda-time"/>
       </artifact:pom>
 
       <!-- now the pom's for artifacts being deployed to Maven Central -->
@@ -559,8 +557,8 @@
         <dependency groupId="org.mindrot" artifactId="jbcrypt"/>
         <dependency groupId="io.dropwizard.metrics" artifactId="metrics-core"/>
         <dependency groupId="com.addthis.metrics" artifactId="reporter-config3"/>
-        <dependency groupId="com.thinkaurelius.thrift" artifactId="thrift-server" version="0.3.5"/>
-        <dependency groupId="com.clearspring.analytics" artifactId="stream" version="2.5.2" />
+        <dependency groupId="com.thinkaurelius.thrift" artifactId="thrift-server"/>
+        <dependency groupId="com.clearspring.analytics" artifactId="stream"/>
 
         <dependency groupId="ch.qos.logback" artifactId="logback-core"/>
         <dependency groupId="ch.qos.logback" artifactId="logback-classic"/>
@@ -577,16 +575,16 @@
         -->
 
         <!-- don't need jna to run, but nice to have -->
-        <dependency groupId="net.java.dev.jna" artifactId="jna" version="4.0.0"/>
+        <dependency groupId="net.java.dev.jna" artifactId="jna"/>
         
         <!-- don't need jamm unless running a server in which case it needs to be a -javagent to be used anyway -->
         <dependency groupId="com.github.jbellis" artifactId="jamm"/>
 
         <dependency groupId="io.netty" artifactId="netty-all"/>
       	
-      	<dependency groupId="joda-time" artifactId="joda-time" version="2.4" />
+      	<dependency groupId="joda-time" artifactId="joda-time"/>
 
-        <dependency groupId="org.fusesource" artifactId="sigar" version="1.6.4"/>
+        <dependency groupId="org.fusesource" artifactId="sigar"/>
       	
         <dependency groupId="org.eclipse.jdt.core.compiler" artifactId="ecj" />
       </artifact:pom>
@@ -1221,6 +1219,8 @@
         <jvmarg value="-Dcassandra.test.sstableformatdevelopment=true"/>
         <!-- The first time SecureRandom initializes can be slow if it blocks on /dev/random -->
         <jvmarg value="-Djava.security.egd=file:/dev/urandom" />
+        <jvmarg value="-Dcassandra.testtag=@{testtag}"/>
+        <jvmarg value="-Dcassandra.keepBriefBrief=${cassandra.keepBriefBrief}" />
 	<optjvmargs/>
         <classpath>
           <path refid="cassandra.classpath" />

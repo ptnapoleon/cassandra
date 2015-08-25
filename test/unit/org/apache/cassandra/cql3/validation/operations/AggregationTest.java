@@ -94,6 +94,45 @@ public class AggregationTest extends CQLTester
     }
 
     @Test
+    public void testCountStarFunction() throws Throwable
+    {
+        createTable("CREATE TABLE %s (a int, b int, c double, primary key (a, b))");
+
+        // Test with empty table
+        assertColumnNames(execute("SELECT COUNT(*) FROM %s"), "count");
+        assertRows(execute("SELECT COUNT(*) FROM %s"), row(0L));
+        assertColumnNames(execute("SELECT COUNT(1) FROM %s"), "count");
+        assertRows(execute("SELECT COUNT(1) FROM %s"), row(0L));
+        assertColumnNames(execute("SELECT COUNT(*), COUNT(*) FROM %s"), "count", "count");
+        assertRows(execute("SELECT COUNT(*), COUNT(*) FROM %s"), row(0L, 0L));
+
+        // Test with alias
+        assertColumnNames(execute("SELECT COUNT(*) as myCount FROM %s"), "mycount");
+        assertRows(execute("SELECT COUNT(*) as myCount FROM %s"), row(0L));
+        assertColumnNames(execute("SELECT COUNT(1) as myCount FROM %s"), "mycount");
+        assertRows(execute("SELECT COUNT(1) as myCount FROM %s"), row(0L));
+
+        // Test invalid call
+        assertInvalidSyntaxMessage("Only COUNT(1) is supported, got COUNT(2)", "SELECT COUNT(2) FROM %s");
+
+        // Test with other aggregates
+        assertColumnNames(execute("SELECT COUNT(*), max(b), b FROM %s"), "count", "system.max(b)", "b");
+        assertRows(execute("SELECT COUNT(*), max(b), b  FROM %s"), row(0L, null, null));
+        assertColumnNames(execute("SELECT COUNT(1), max(b), b FROM %s"), "count", "system.max(b)", "b");
+        assertRows(execute("SELECT COUNT(1), max(b), b  FROM %s"), row(0L, null, null));
+
+        execute("INSERT INTO %s (a, b, c) VALUES (1, 1, 11.5)");
+        execute("INSERT INTO %s (a, b, c) VALUES (1, 2, 9.5)");
+        execute("INSERT INTO %s (a, b, c) VALUES (1, 3, 9.0)");
+        execute("INSERT INTO %s (a, b, c) VALUES (1, 5, 1.0)");
+
+        assertRows(execute("SELECT COUNT(*) FROM %s"), row(4L));
+        assertRows(execute("SELECT COUNT(1) FROM %s"), row(4L));
+        assertRows(execute("SELECT max(b), b, COUNT(*) FROM %s"), row(5, 1, 4L));
+        assertRows(execute("SELECT max(b), COUNT(1), b FROM %s"), row(5, 4L, 1));
+    }
+
+    @Test
     public void testAggregateWithColumns() throws Throwable
     {
         createTable("CREATE TABLE %s (a int, b int, c int, primary key (a, b))");
@@ -1472,7 +1511,7 @@ public class AggregationTest extends CQLTester
         execute("INSERT INTO %s (a, b) VALUES (?, {f : ?})", 3, 7);
 
         String fState = createFunction(KEYSPACE,
-                                       "tuple<int, int>",
+                                       myType + ',' + myType,
                                        "CREATE FUNCTION %s (state " + myType + ", values " + myType + ") " +
                                        "CALLED ON NULL INPUT " +
                                        "RETURNS " + myType + " " +
@@ -1542,7 +1581,7 @@ public class AggregationTest extends CQLTester
                                       "INITCOND ''");
 
         String fRNON = createFunction(KEYSPACE,
-                                      "text",
+                                      "text, text",
                                       "CREATE FUNCTION %s(a text, b text) " +
                                       "RETURNS NULL ON NULL INPUT " +
                                       "RETURNS text " +
@@ -1558,7 +1597,7 @@ public class AggregationTest extends CQLTester
                                       "AS 'return \"fin\" + a;'");
 
         String aRNON = createAggregate(KEYSPACE,
-                                      "int",
+                                      "text",
                                       "CREATE AGGREGATE %s(text) " +
                                       "SFUNC " + shortFunctionName(fRNON) + ' ' +
                                       "STYPE text " +

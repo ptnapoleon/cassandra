@@ -23,6 +23,9 @@ New features
      for non-primary key queries, and perform much better for indexing high
      cardinality columns.
      See http://www.datastax.com/dev/blog/new-in-cassandra-3-0-materialized-views
+   - Hinted handoff has been completely rewritten. Hints are now stored in flat
+     files, with less overhead for storage and more efficient dispatch.
+     See CASSANDRA-6230 for full details.
    - Option to not purge unrepaired tombstones. To avoid users having data resurrected
      if repair has not been run within gc_grace_seconds, an option has been added to
      only allow tombstones from repaired sstables to be purged. To enable, set the
@@ -30,14 +33,33 @@ New features
      you do not run repair for a long time, you will keep all tombstones around which
      can cause other problems.
 
-
 Upgrading
 ---------
-   - 3.0 requires Java 8u20 or later.
+   - Max mutation size is now configurable via max_mutation_size_in_kb setting in
+     cassandra.yaml; the default is half the size commitlog_segment_size_in_mb * 1024.
+   - 3.0 requires Java 8u40 or later.
    - The default JVM GC has been changed to G1GC.
    - The default JVM flag -XX:+PerfDisableSharedMem will cause the following tools JVM
      to stop working: jps, jstack, jinfo, jmc, jcmd as well as 3rd party tools like Jolokia.
      If you wish to use these tools you can comment this flag out in cassandra-env.{sh,ps1}
+   - New transaction log files have been introduced to replace the compactions_in_progress
+     system table, temporary file markers (tmp and tmplink) and sstable ancerstors.
+     Therefore, compaction metadata no longer contains ancestors. Transaction log files
+     list sstable descriptors involved in compactions and other operations such as flushing
+     and streaming. Use the sstableutil tool to list any sstable files currently involved
+     in operations not yet completed, which previously would have been marked as temporary.
+     A transaction log file contains one sstable per line, with the prefix "add:" or "remove:".
+     They also contain a special line "commit", only inserted at the end when the transaction
+     is committed. On startup we use these files to cleanup any partial transactions that were
+     in progress when the process exited. If the commit line is found, we keep new sstables
+     (those with the "add" prefix) and delete the old sstables (those with the "remove" prefix),
+     vice-versa if the commit line is missing. Should you lose or delete these log files,
+     both old and new sstable files will be kept as live files, which will result in duplicated
+     sstables. These files are protected by incremental checksums so you should not manually
+     edit them. When restoring a full backup or moving sstable files, you should clean-up
+     any left over transactions and their temporary files first. You can use this command:
+      ===> sstableutil -c ks table
+     See CASSANDRA-7066 for full details.
    - New write stages have been added for batchlog and materialized view mutations
      you can set their size in cassandra.yaml
    - User defined functions are now executed in a sandbox.
@@ -64,11 +86,19 @@ Upgrading
      be done by setting the new option `enabled` to `false`.
    - Only map syntax is now allowed for caching options. ALL/NONE/KEYS_ONLY/ROWS_ONLY syntax
      has been deprecated since 2.1.0 and is being removed in 3.0.0.
+   - The 'index_interval' option for 'CREATE TABLE' statements, which has been deprecated
+     since 2.1 and replaced with the 'min_index_interval' and 'max_index_interval' options,
+     has now been removed.
    - Batchlog entries are now stored in a new table - system.batches.
      The old one has been deprecated.
    - JMX methods set/getCompactionStrategyClass have been removed, use
      set/getCompactionParameters or set/getCompactionParametersJson instead.
    - SizeTieredCompactionStrategy parameter cold_reads_to_omit has been removed.
+   - The secondary index API has been comprehensively reworked. This will be a breaking
+     change for any custom index implementations, which should now look to implement
+     the new org.apache.cassandra.index.Index interface.
+
+
 
 2.2
 ===
@@ -157,6 +187,7 @@ New features
    - The toTimestamp(date) and toUnixTimestamp(date) functions have been added to allow
      to convert from date into timestamp type and bigint raw value.
    - SizeTieredCompactionStrategy parameter cold_reads_to_omit has been removed.
+   - COUNT(*) and COUNT(1) can be selected with other columns or functions
 
 
 2.1.9

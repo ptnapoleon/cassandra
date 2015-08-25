@@ -179,33 +179,30 @@ public class StartupChecks
         }
     };
 
-    public static final StartupCheck checkDataDirs = new StartupCheck()
+    public static final StartupCheck checkDataDirs = () ->
     {
-        public void execute() throws StartupException
+        // check all directories(data, commitlog, saved cache) for existence and permission
+        Iterable<String> dirs = Iterables.concat(Arrays.asList(DatabaseDescriptor.getAllDataFileLocations()),
+                                                 Arrays.asList(DatabaseDescriptor.getCommitLogLocation(),
+                                                               DatabaseDescriptor.getSavedCachesLocation(),
+                                                               DatabaseDescriptor.getHintsDirectory().getAbsolutePath()));
+        for (String dataDir : dirs)
         {
-            // check all directories(data, commitlog, saved cache) for existence and permission
-            Iterable<String> dirs = Iterables.concat(Arrays.asList(DatabaseDescriptor.getAllDataFileLocations()),
-                                                     Arrays.asList(DatabaseDescriptor.getCommitLogLocation(),
-                                                                   DatabaseDescriptor.getSavedCachesLocation()));
-            for (String dataDir : dirs)
+            logger.debug("Checking directory {}", dataDir);
+            File dir = new File(dataDir);
+
+            // check that directories exist.
+            if (!dir.exists())
             {
-                logger.debug("Checking directory {}", dataDir);
-                File dir = new File(dataDir);
-
-                // check that directories exist.
-                if (!dir.exists())
-                {
-                    logger.error("Directory {} doesn't exist", dataDir);
-                    // if they don't, failing their creation, stop cassandra.
-                    if (!dir.mkdirs())
-                        throw new StartupException(3, "Has no permission to create directory "+ dataDir);
-                }
-
-                // if directories exist verify their permissions
-                if (!Directories.verifyFullPermissions(dir, dataDir))
-                    throw new StartupException(3, "Insufficient permissions on directory " + dataDir);
-
+                logger.warn("Directory {} doesn't exist", dataDir);
+                // if they don't, failing their creation, stop cassandra.
+                if (!dir.mkdirs())
+                    throw new StartupException(3, "Has no permission to create directory "+ dataDir);
             }
+
+            // if directories exist verify their permissions
+            if (!Directories.verifyFullPermissions(dir, dataDir))
+                throw new StartupException(3, "Insufficient permissions on directory " + dataDir);
         }
     };
 
@@ -237,8 +234,7 @@ public class StartupChecks
                 {
                     String name = dir.getFileName().toString();
                     return (name.equals(Directories.SNAPSHOT_SUBDIR)
-                            || name.equals(Directories.BACKUPS_SUBDIR)
-                            || name.equals(Directories.TRANSACTIONS_SUBDIR))
+                            || name.equals(Directories.BACKUPS_SUBDIR))
                            ? FileVisitResult.SKIP_SUBTREE
                            : FileVisitResult.CONTINUE;
                 }

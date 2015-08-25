@@ -17,18 +17,19 @@
  */
 package org.apache.cassandra.cql3.statements;
 
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
 import org.apache.cassandra.auth.Permission;
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.ColumnDefinition;
-import org.apache.cassandra.config.MaterializedViewDefinition;
-import org.apache.cassandra.config.Schema;
-import org.apache.cassandra.cql3.*;
-import org.apache.cassandra.db.marshal.*;
+import org.apache.cassandra.config.*;
+import org.apache.cassandra.cql3.CFName;
+import org.apache.cassandra.cql3.CQL3Type;
+import org.apache.cassandra.cql3.ColumnIdentifier;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.CollectionType;
+import org.apache.cassandra.db.marshal.CounterColumnType;
 import org.apache.cassandra.exceptions.*;
+import org.apache.cassandra.schema.IndexMetadata;
+import org.apache.cassandra.schema.Indexes;
 import org.apache.cassandra.schema.TableParams;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.MigrationManager;
@@ -263,6 +264,18 @@ public class AlterTableStatement extends SchemaAlteringStatement
                         break;
                 }
 
+                // If the dropped column is the only target column of a secondary
+                // index (and it's only possible to create an index with TargetType.COLUMN
+                // and a single target right now) we need to also drop the index.
+                Indexes allIndexes = cfm.getIndexes();
+                Collection<IndexMetadata> indexes = allIndexes.get(def);
+                for (IndexMetadata index : indexes)
+                {
+                    assert index.columns.size() == 1 : String.format("Can't drop column %s as it's a target of multi-column index %s", def.name, index.name);
+                    allIndexes = allIndexes.without(index.name);
+                }
+                cfm.indexes(allIndexes);
+
                 // If a column is dropped which is the target of a materialized view,
                 // then we need to drop the view.
                 // If a column is dropped which was selected into a materialized view,
@@ -290,6 +303,15 @@ public class AlterTableStatement extends SchemaAlteringStatement
                 attrs.validate();
 
                 TableParams params = attrs.asAlteredTableParams(cfm.params);
+
+                if (cfm.hasMaterializedViews() && params.gcGraceSeconds == 0)
+                {
+                    throw new InvalidRequestException("Cannot alter gc_grace_seconds of the base table of a " +
+                                                      "materialized view to 0, since this value is used to TTL " +
+                                                      "undelivered updates. Setting gc_grace_seconds too low might " +
+                                                      "cause undelivered updates to expire " +
+                                                      "before being replayed.");
+                }
 
                 if (meta.isCounter() && params.defaultTimeToLive > 0)
                     throw new InvalidRequestException("Cannot set default_time_to_live on a table with counters");

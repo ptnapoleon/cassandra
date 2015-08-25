@@ -221,12 +221,27 @@ Function ParseJVMInfo
     $pinfo.RedirectStandardError = $true
     $pinfo.RedirectStandardOutput = $true
     $pinfo.UseShellExecute = $false
-    $pinfo.Arguments = "-version"
+    $pinfo.Arguments = "-d64 -version"
     $p = New-Object System.Diagnostics.Process
     $p.StartInfo = $pinfo
     $p.Start() | Out-Null
     $p.WaitForExit()
     $stderr = $p.StandardError.ReadToEnd()
+
+    $env:JVM_ARCH = "64-bit"
+
+    if ($stderr.Contains("Error"))
+    {
+        # 32-bit JVM. re-run w/out -d64
+        echo "Failed 64-bit check. Re-running to get version from 32-bit"
+        $pinfo.Arguments = "-version"
+        $p = New-Object System.Diagnostics.Process
+        $p.StartInfo = $pinfo
+        $p.Start() | Out-Null
+        $p.WaitForExit()
+        $stderr = $p.StandardError.ReadToEnd()
+        $env:JVM_ARCH = "32-bit"
+    }
 
     $sa = $stderr.Split("""")
     $env:JVM_VERSION = $sa[1]
@@ -246,29 +261,11 @@ Function ParseJVMInfo
 
     $pa = $sa[1].Split("_")
     $env:JVM_PATCH_VERSION=$pa[1]
-
-    # get 64-bit vs. 32-bit
-    $pinfo.Arguments = "-d64 -version"
-    $pArch = New-Object System.Diagnostics.Process
-    $p.StartInfo = $pinfo
-    $p.Start() | Out-Null
-    $p.WaitForExit()
-    $stderr = $p.StandardError.ReadToEnd()
-
-    if ($stderr.Contains("Error"))
-    {
-        $env:JVM_ARCH = "32-bit"
-    }
-    else
-    {
-        $env:JVM_ARCH = "64-bit"
-    }
 }
 
 #-----------------------------------------------------------------------------
 Function SetCassandraEnvironment
 {
-    echo "Setting up Cassandra environment"
     if (Test-Path Env:\JAVA_HOME)
     {
         $env:JAVA_BIN = "$env:JAVA_HOME\bin\java.exe"
@@ -333,7 +330,7 @@ Function SetCassandraEnvironment
         $env:JVM_OPTS = "$env:JVM_OPTS -javaagent:""$env:CASSANDRA_HOME\lib\jamm-0.3.0.jar"""
     }
 
-    if ($env:JVM_VERSION.CompareTo("1.8.0_40" -eq -1))
+    if ($env:JVM_VERSION.CompareTo("1.8.0_40") -eq -1)
     {
         echo "Cassandra 3.0 and later require Java 8u40 or later."
         exit

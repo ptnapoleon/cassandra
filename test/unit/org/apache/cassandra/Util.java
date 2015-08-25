@@ -32,7 +32,6 @@ import java.util.function.Supplier;
 import com.google.common.base.Function;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Iterators;
-
 import org.apache.commons.lang3.StringUtils;
 
 import org.apache.cassandra.config.CFMetaData;
@@ -40,13 +39,15 @@ import org.apache.cassandra.config.ColumnDefinition;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.db.*;
-import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.db.compaction.AbstractCompactionTask;
 import org.apache.cassandra.db.compaction.CompactionManager;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.partitions.*;
-import org.apache.cassandra.dht.*;
+import org.apache.cassandra.db.rows.*;
+import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.dht.RandomPartitioner.BigIntegerToken;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.gms.ApplicationState;
 import org.apache.cassandra.gms.Gossiper;
 import org.apache.cassandra.gms.VersionedValue;
@@ -297,16 +298,16 @@ public class Util
         }
     }
 
-    public static List<ArrayBackedPartition> getAllUnfiltered(ReadCommand command)
+    public static List<ImmutableBTreePartition> getAllUnfiltered(ReadCommand command)
     {
-        List<ArrayBackedPartition> results = new ArrayList<>();
+        List<ImmutableBTreePartition> results = new ArrayList<>();
         try (ReadOrderGroup orderGroup = command.startOrderGroup(); UnfilteredPartitionIterator iterator = command.executeLocally(orderGroup))
         {
             while (iterator.hasNext())
             {
                 try (UnfilteredRowIterator partition = iterator.next())
                 {
-                    results.add(ArrayBackedPartition.create(partition));
+                    results.add(ImmutableBTreePartition.create(partition));
                 }
             }
         }
@@ -362,7 +363,7 @@ public class Util
         }
     }
 
-    public static ArrayBackedPartition getOnlyPartitionUnfiltered(ReadCommand cmd)
+    public static ImmutableBTreePartition getOnlyPartitionUnfiltered(ReadCommand cmd)
     {
         try (ReadOrderGroup orderGroup = cmd.startOrderGroup(); UnfilteredPartitionIterator iterator = cmd.executeLocally(orderGroup))
         {
@@ -370,7 +371,7 @@ public class Util
             try (UnfilteredRowIterator partition = iterator.next())
             {
                 assert !iterator.hasNext() : "Expecting a single partition but got more";
-                return ArrayBackedPartition.create(partition);
+                return ImmutableBTreePartition.create(partition);
             }
         }
     }
@@ -530,5 +531,11 @@ public class Util
     public static void joinThread(Thread thread) throws InterruptedException
     {
         thread.join(10000);
+    }
+
+    // for use with Optional in tests, can be used as an argument to orElseThrow
+    public static Supplier<AssertionError> throwAssert(final String message)
+    {
+        return () -> new AssertionError(message);
     }
 }

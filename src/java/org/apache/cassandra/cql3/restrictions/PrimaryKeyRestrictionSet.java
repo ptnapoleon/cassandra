@@ -27,8 +27,8 @@ import org.apache.cassandra.cql3.functions.Function;
 import org.apache.cassandra.cql3.statements.Bound;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.filter.RowFilter;
-import org.apache.cassandra.db.index.SecondaryIndexManager;
 import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.index.SecondaryIndexManager;
 import org.apache.cassandra.utils.btree.BTreeSet;
 
 import static org.apache.cassandra.cql3.statements.RequestValidations.checkFalse;
@@ -104,7 +104,7 @@ final class PrimaryKeyRestrictionSet extends AbstractPrimaryKeyRestrictions
             this.slice = true;
         else if (restriction.isContains() || primaryKeyRestrictions.isContains())
             this.contains = true;
-        else if (restriction.isIN())
+        else if (restriction.isIN() || primaryKeyRestrictions.isIN())
             this.in = true;
         else
             this.eq = true;

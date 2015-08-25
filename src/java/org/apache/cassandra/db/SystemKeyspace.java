@@ -17,18 +17,22 @@
  */
 package org.apache.cassandra.db;
 
-import java.io.*;
+import java.io.File;
+import java.io.IOError;
+import java.io.IOException;
 import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
-
+import java.util.stream.Collectors;
+import java.util.stream.StreamSupport;
 import javax.management.openmbean.OpenDataException;
 import javax.management.openmbean.TabularData;
 
-import com.google.common.collect.*;
+import com.google.common.collect.HashMultimap;
+import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.SetMultimap;
 import com.google.common.io.ByteStreams;
-
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -37,25 +41,18 @@ import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.cql3.functions.*;
-import org.apache.cassandra.db.partitions.*;
 import org.apache.cassandra.db.commitlog.ReplayPosition;
 import org.apache.cassandra.db.compaction.CompactionHistoryTabularData;
 import org.apache.cassandra.db.marshal.*;
-import org.apache.cassandra.dht.IPartitioner;
-import org.apache.cassandra.dht.LocalPartitioner;
-import org.apache.cassandra.dht.Range;
-import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.db.partitions.PartitionUpdate;
+import org.apache.cassandra.dht.*;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.io.sstable.Descriptor;
-import org.apache.cassandra.io.util.DataInputBuffer;
-import org.apache.cassandra.io.util.DataOutputBuffer;
-import org.apache.cassandra.io.util.FileUtils;
-import org.apache.cassandra.io.util.NIODataInputStream;
+import org.apache.cassandra.io.util.*;
 import org.apache.cassandra.locator.IEndpointSnitch;
 import org.apache.cassandra.metrics.RestorableMeter;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.schema.*;
-import org.apache.cassandra.schema.Tables;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.service.paxos.Commit;
 import org.apache.cassandra.service.paxos.PaxosState;
@@ -65,7 +62,6 @@ import org.apache.cassandra.utils.*;
 
 import static java.util.Collections.emptyMap;
 import static java.util.Collections.singletonMap;
-
 import static org.apache.cassandra.cql3.QueryProcessor.executeInternal;
 import static org.apache.cassandra.cql3.QueryProcessor.executeOnceInternal;
 
@@ -88,7 +84,6 @@ public final class SystemKeyspace
 
     public static final String NAME = "system";
 
-    public static final String HINTS = "hints";
     public static final String BATCHES = "batches";
     public static final String PAXOS = "paxos";
     public static final String BUILT_INDEXES = "IndexInfo";
@@ -103,6 +98,7 @@ public final class SystemKeyspace
     public static final String MATERIALIZED_VIEWS_BUILDS_IN_PROGRESS = "materialized_views_builds_in_progress";
     public static final String BUILT_MATERIALIZED_VIEWS = "built_materialized_views";
 
+    @Deprecated public static final String LEGACY_HINTS = "hints";
     @Deprecated public static final String LEGACY_BATCHLOG = "batchlog";
     @Deprecated public static final String LEGACY_KEYSPACES = "schema_keyspaces";
     @Deprecated public static final String LEGACY_COLUMNFAMILIES = "schema_columnfamilies";
@@ -111,19 +107,6 @@ public final class SystemKeyspace
     @Deprecated public static final String LEGACY_USERTYPES = "schema_usertypes";
     @Deprecated public static final String LEGACY_FUNCTIONS = "schema_functions";
     @Deprecated public static final String LEGACY_AGGREGATES = "schema_aggregates";
-
-    public static final CFMetaData Hints =
-        compile(HINTS,
-                "hints awaiting delivery",
-                "CREATE TABLE %s ("
-                + "target_id uuid,"
-                + "hint_id timeuuid,"
-                + "message_version int,"
-                + "mutation blob,"
-                + "PRIMARY KEY ((target_id), hint_id, message_version)) "
-                + "WITH COMPACT STORAGE")
-                .compaction(CompactionParams.scts(singletonMap("enabled", "false")))
-                .gcGraceSeconds(0);
 
     public static final CFMetaData Batches =
         compile(BATCHES,
@@ -282,6 +265,20 @@ public final class SystemKeyspace
                 + "PRIMARY KEY ((keyspace_name), view_name))");
 
     @Deprecated
+    public static final CFMetaData LegacyHints =
+        compile(LEGACY_HINTS,
+                "*DEPRECATED* hints awaiting delivery",
+                "CREATE TABLE %s ("
+                + "target_id uuid,"
+                + "hint_id timeuuid,"
+                + "message_version int,"
+                + "mutation blob,"
+                + "PRIMARY KEY ((target_id), hint_id, message_version)) "
+                + "WITH COMPACT STORAGE")
+                .compaction(CompactionParams.scts(singletonMap("enabled", "false")))
+                .gcGraceSeconds(0);
+
+    @Deprecated
     public static final CFMetaData LegacyBatchlog =
         compile(LEGACY_BATCHLOG,
                 "*DEPRECATED* batchlog entries",
@@ -423,7 +420,6 @@ public final class SystemKeyspace
     private static Tables tables()
     {
         return Tables.of(BuiltIndexes,
-                         Hints,
                          Batches,
                          Paxos,
                          Local,
@@ -436,6 +432,7 @@ public final class SystemKeyspace
                          AvailableRanges,
                          MaterializedViewsBuildsInProgress,
                          BuiltMaterializedViews,
+                         LegacyHints,
                          LegacyBatchlog,
                          LegacyKeyspaces,
                          LegacyColumnfamilies,
@@ -515,7 +512,14 @@ public final class SystemKeyspace
         if (ksname.equals("system") && cfname.equals(COMPACTION_HISTORY))
             return;
         String req = "INSERT INTO system.%s (id, keyspace_name, columnfamily_name, compacted_at, bytes_in, bytes_out, rows_merged) VALUES (?, ?, ?, ?, ?, ?, ?)";
-        executeInternal(String.format(req, COMPACTION_HISTORY), UUIDGen.getTimeUUID(), ksname, cfname, ByteBufferUtil.bytes(compactedAt), bytesIn, bytesOut, rowsMerged);
+        executeInternal(String.format(req, COMPACTION_HISTORY),
+                        UUIDGen.getTimeUUID(),
+                        ksname,
+                        cfname,
+                        ByteBufferUtil.bytes(compactedAt),
+                        bytesIn,
+                        bytesOut,
+                        rowsMerged);
     }
 
     public static TabularData getCompactionHistory() throws OpenDataException
@@ -1027,6 +1031,16 @@ public final class SystemKeyspace
         String req = "DELETE FROM %s.\"%s\" WHERE table_name = ? AND index_name = ?";
         executeInternal(String.format(req, NAME, BUILT_INDEXES), keyspaceName, indexName);
         forceBlockingFlush(BUILT_INDEXES);
+    }
+
+    public static List<String> getBuiltIndexes(String keyspaceName, Set<String> indexNames)
+    {
+        List<String> names = new ArrayList<>(indexNames);
+        String req = "SELECT index_name from %s.\"%s\" WHERE table_name=? AND index_name IN ?";
+        UntypedResultSet results = executeInternal(String.format(req, NAME, BUILT_INDEXES), keyspaceName, names);
+        return StreamSupport.stream(results.spliterator(), false)
+                            .map(r -> r.getString("index_name"))
+                            .collect(Collectors.toList());
     }
 
     /**

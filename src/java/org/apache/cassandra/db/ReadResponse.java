@@ -42,7 +42,12 @@ import org.apache.cassandra.utils.FBUtilities;
 
 public abstract class ReadResponse
 {
+    // Serializer for single partition read response
     public static final IVersionedSerializer<ReadResponse> serializer = new Serializer();
+    // Serializer for partition range read response (this actually delegate to 'serializer' in 3.0 and to
+    // 'legacyRangeSliceReplySerializer' in older version.
+    public static final IVersionedSerializer<ReadResponse> rangeSliceSerializer = new RangeSliceSerializer();
+    // Serializer for the pre-3.0 rang slice responses.
     public static final IVersionedSerializer<ReadResponse> legacyRangeSliceReplySerializer = new LegacyRangeSliceReplySerializer();
 
     // This is used only when serializing data responses and we can't it easily in other cases. So this can be null, which is slighly
@@ -214,9 +219,9 @@ public abstract class ReadResponse
      */
     private static class LegacyRemoteDataResponse extends ReadResponse
     {
-        private final List<ArrayBackedPartition> partitions;
+        private final List<ImmutableBTreePartition> partitions;
 
-        private LegacyRemoteDataResponse(List<ArrayBackedPartition> partitions)
+        private LegacyRemoteDataResponse(List<ImmutableBTreePartition> partitions)
         {
             super(null); // we never serialize LegacyRemoteDataResponses, so we don't care about the metadata
             this.partitions = partitions;
@@ -245,7 +250,7 @@ public abstract class ReadResponse
 
                 public UnfilteredRowIterator next()
                 {
-                    ArrayBackedPartition partition = partitions.get(idx++);
+                    ImmutableBTreePartition partition = partitions.get(idx++);
 
                     ClusteringIndexFilter filter = command.clusteringIndexFilter(partition.partitionKey());
 
@@ -340,7 +345,7 @@ public abstract class ReadResponse
 
                 try
                 {
-                    return new LegacyRemoteDataResponse(Collections.singletonList(ArrayBackedPartition.create(rowIterator)));
+                    return new LegacyRemoteDataResponse(Collections.singletonList(ImmutableBTreePartition.create(rowIterator)));
                 }
                 finally
                 {
@@ -397,6 +402,31 @@ public abstract class ReadResponse
         }
     }
 
+    private static class RangeSliceSerializer implements IVersionedSerializer<ReadResponse>
+    {
+        public void serialize(ReadResponse response, DataOutputPlus out, int version) throws IOException
+        {
+            if (version < MessagingService.VERSION_30)
+                legacyRangeSliceReplySerializer.serialize(response, out, version);
+            else
+                serializer.serialize(response, out, version);
+        }
+
+        public ReadResponse deserialize(DataInputPlus in, int version) throws IOException
+        {
+            return version < MessagingService.VERSION_30
+                 ? legacyRangeSliceReplySerializer.deserialize(in, version)
+                 : serializer.deserialize(in, version);
+        }
+
+        public long serializedSize(ReadResponse response, int version)
+        {
+            return version < MessagingService.VERSION_30
+                 ? legacyRangeSliceReplySerializer.serializedSize(response, version)
+                 : serializer.serializedSize(response, version);
+        }
+    }
+
     private static class LegacyRangeSliceReplySerializer implements IVersionedSerializer<ReadResponse>
     {
         public void serialize(ReadResponse response, DataOutputPlus out, int version) throws IOException
@@ -440,13 +470,13 @@ public abstract class ReadResponse
         {
             // Contrarily to serialize, we have to read the number of serialized partitions here.
             int partitionCount = in.readInt();
-            ArrayList<ArrayBackedPartition> partitions = new ArrayList<>(partitionCount);
+            ArrayList<ImmutableBTreePartition> partitions = new ArrayList<>(partitionCount);
             for (int i = 0; i < partitionCount; i++)
             {
                 ByteBuffer key = ByteBufferUtil.readWithShortLength(in);
                 try (UnfilteredRowIterator partition = LegacyLayout.deserializeLegacyPartition(in, version, SerializationHelper.Flag.FROM_REMOTE, key))
                 {
-                    partitions.add(ArrayBackedPartition.create(partition));
+                    partitions.add(ImmutableBTreePartition.create(partition));
                 }
             }
             return new LegacyRemoteDataResponse(partitions);

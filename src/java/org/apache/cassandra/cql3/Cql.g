@@ -298,8 +298,7 @@ selectStatement returns [SelectStatement.RawStatement expr]
     }
     : K_SELECT 
       ( K_JSON { isJson = true; } )?
-      ( ( K_DISTINCT { isDistinct = true; } )? sclause=selectClause
-        | sclause=selectCountClause )
+      ( ( K_DISTINCT { isDistinct = true; } )? sclause=selectClause )
       K_FROM cf=columnFamilyName
       ( K_WHERE wclause=whereClause )?
       ( K_ORDER K_BY orderByClause[orderings] ( ',' orderByClause[orderings] )* )?
@@ -327,6 +326,7 @@ selector returns [RawSelector s]
 unaliasedSelector returns [Selectable.Raw s]
     @init { Selectable.Raw tmp = null; }
     :  ( c=cident                                  { tmp = c; }
+       | K_COUNT '(' countArgument ')'             { tmp = new Selectable.WithFunction.Raw(FunctionName.nativeFunction("countRows"), Collections.<Selectable.Raw>emptyList());}
        | K_WRITETIME '(' c=cident ')'              { tmp = new Selectable.WritetimeOrTTL.Raw(c, true); }
        | K_TTL       '(' c=cident ')'              { tmp = new Selectable.WritetimeOrTTL.Raw(c, false); }
        | f=functionName args=selectionFunctionArgs { tmp = new Selectable.WithFunction.Raw(f, args); }
@@ -338,11 +338,6 @@ selectionFunctionArgs returns [List<Selectable.Raw> a]
     | '(' s1=unaliasedSelector { List<Selectable.Raw> args = new ArrayList<Selectable.Raw>(); args.add(s1); }
           ( ',' sn=unaliasedSelector { args.add(sn); } )*
       ')' { $a = args; }
-    ;
-
-selectCountClause returns [List<RawSelector> expr]
-    @init{ ColumnIdentifier alias = new ColumnIdentifier("count", false); }
-    : K_COUNT '(' countArgument ')' (K_AS c=noncol_ident { alias = c; })? { $expr = new ArrayList<RawSelector>(); $expr.add( new RawSelector(new Selectable.WithFunction.Raw(FunctionName.nativeFunction("countRows"), Collections.<Selectable.Raw>emptyList()), alias));}
     ;
 
 countArgument
@@ -1226,6 +1221,7 @@ idxName[IndexName name]
 
 roleName[RoleName name]
     : t=IDENT              { $name.setName($t.text, false); }
+    | s=STRING_LITERAL     { $name.setName($s.text, false); }
     | t=QUOTED_NAME        { $name.setName($t.text, true); }
     | k=unreserved_keyword { $name.setName(k, false); }
     | QMARK {addRecognitionError("Bind variables cannot be used for role names");}
@@ -1550,6 +1546,7 @@ tuple_type returns [CQL3Type.Raw t]
 username
     : IDENT
     | STRING_LITERAL
+    | QUOTED_NAME { addRecognitionError("Quoted strings are are not supported for user names and USER is deprecated, please use ROLE");}
     ;
 
 // Basically the same as cident, but we need to exlude existing CQL3 types

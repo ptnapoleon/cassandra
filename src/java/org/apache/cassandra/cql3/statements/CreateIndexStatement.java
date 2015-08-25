@@ -20,18 +20,25 @@ package org.apache.cassandra.cql3.statements;
 import java.util.Collections;
 import java.util.Map;
 
+import com.google.common.base.Optional;
+import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.Iterables;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.auth.Permission;
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.ColumnDefinition;
-import org.apache.cassandra.config.IndexType;
 import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.cql3.CFName;
+import org.apache.cassandra.cql3.IndexName;
 import org.apache.cassandra.db.marshal.MapType;
-import org.apache.cassandra.exceptions.*;
-import org.apache.cassandra.cql3.*;
+import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.exceptions.RequestValidationException;
+import org.apache.cassandra.exceptions.UnauthorizedException;
+import org.apache.cassandra.schema.IndexMetadata;
+import org.apache.cassandra.schema.Indexes;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.MigrationManager;
 import org.apache.cassandra.thrift.ThriftValidation;
@@ -91,22 +98,15 @@ public class CreateIndexStatement extends SchemaAlteringStatement
             validateTargetColumnIsMapIfIndexInvolvesKeys(isMap, target);
         }
 
-        if (cd.getIndexType() != null)
+        if (!Strings.isNullOrEmpty(indexName))
         {
-            IndexTarget.TargetType prevType = IndexTarget.TargetType.fromColumnDefinition(cd);
-            if (isMap && target.type != prevType)
+            if (Schema.instance.getKSMetaData(keyspace()).existingIndexNames(null).contains(indexName))
             {
-                String msg = "Cannot create index on %s(%s): an index on %s(%s) already exists and indexing " +
-                             "a map on more than one dimension at the same time is not currently supported";
-                throw new InvalidRequestException(String.format(msg,
-                                                                target.type, target.column,
-                                                                prevType, target.column));
+                if (ifNotExists)
+                    return;
+                else
+                    throw new InvalidRequestException(String.format("Index %s already exists", indexName));
             }
-
-            if (ifNotExists)
-                return;
-            else
-                throw new InvalidRequestException("Index already exists");
         }
 
         properties.validate();
@@ -135,26 +135,26 @@ public class CreateIndexStatement extends SchemaAlteringStatement
 
     private void validateForFrozenCollection(IndexTarget target) throws InvalidRequestException
     {
-        if (target.type != IndexTarget.TargetType.FULL)
+        if (target.type != IndexTarget.Type.FULL)
             throw new InvalidRequestException(String.format("Cannot create index on %s of frozen<map> column %s", target.type, target.column));
     }
 
     private void validateNotFullIndex(IndexTarget target) throws InvalidRequestException
     {
-        if (target.type == IndexTarget.TargetType.FULL)
+        if (target.type == IndexTarget.Type.FULL)
             throw new InvalidRequestException("full() indexes can only be created on frozen collections");
     }
 
     private void validateIsValuesIndexIfTargetColumnNotCollection(ColumnDefinition cd, IndexTarget target) throws InvalidRequestException
     {
-        if (!cd.type.isCollection() && target.type != IndexTarget.TargetType.VALUES)
+        if (!cd.type.isCollection() && target.type != IndexTarget.Type.VALUES)
             throw new InvalidRequestException(String.format("Cannot create index on %s of column %s; only non-frozen collections support %s indexes",
                                                             target.type, target.column, target.type));
     }
 
     private void validateTargetColumnIsMapIfIndexInvolvesKeys(boolean isMap, IndexTarget target) throws InvalidRequestException
     {
-        if (target.type == IndexTarget.TargetType.KEYS || target.type == IndexTarget.TargetType.KEYS_AND_VALUES)
+        if (target.type == IndexTarget.Type.KEYS || target.type == IndexTarget.Type.KEYS_AND_VALUES)
         {
             if (!isMap)
                 throw new InvalidRequestException(String.format("Cannot create index on %s of column %s with non-map type",
@@ -166,15 +166,26 @@ public class CreateIndexStatement extends SchemaAlteringStatement
     {
         CFMetaData cfm = Schema.instance.getCFMetaData(keyspace(), columnFamily()).copy();
         IndexTarget target = rawTarget.prepare(cfm);
-        logger.debug("Updating column {} definition for index {}", target.column, indexName);
+
         ColumnDefinition cd = cfm.getColumnDefinition(target.column);
+        String acceptedName = indexName;
+        if (Strings.isNullOrEmpty(acceptedName))
+            acceptedName = Indexes.getAvailableIndexName(keyspace(), columnFamily(), cd.name);
 
-        if (cd.getIndexType() != null && ifNotExists)
-            return false;
+        if (Schema.instance.getKSMetaData(keyspace()).existingIndexNames(null).contains(acceptedName))
+        {
+            if (ifNotExists)
+                return false;
+            else
+                throw new InvalidRequestException(String.format("Index %s already exists", acceptedName));
+        }
 
+        IndexMetadata.IndexType indexType;
+        Map<String, String> indexOptions;
         if (properties.isCustom)
         {
-            cd.setIndexType(IndexType.CUSTOM, properties.getOptions());
+            indexType = IndexMetadata.IndexType.CUSTOM;
+            indexOptions = properties.getOptions();
         }
         else if (cfm.isCompound())
         {
@@ -184,15 +195,27 @@ public class CreateIndexStatement extends SchemaAlteringStatement
             // lives easier then.
             if (cd.type.isCollection() && cd.type.isMultiCell())
                 options = ImmutableMap.of(target.type.indexOption(), "");
-            cd.setIndexType(IndexType.COMPOSITES, options);
+            indexType = IndexMetadata.IndexType.COMPOSITES;
+            indexOptions = options;
         }
         else
         {
-            cd.setIndexType(IndexType.KEYS, Collections.<String, String>emptyMap());
+            indexType = IndexMetadata.IndexType.KEYS;
+            indexOptions = Collections.emptyMap();
         }
 
-        cd.setIndexName(indexName);
-        cfm.addDefaultIndexNames();
+        IndexMetadata index = IndexMetadata.singleColumnIndex(cd, acceptedName, indexType, indexOptions);
+
+        // check to disallow creation of an index which duplicates an existing one in all but name
+        Optional<IndexMetadata> existingIndex = Iterables.tryFind(cfm.getIndexes(), existing -> existing.equalsWithoutName(index));
+        if (existingIndex.isPresent())
+            throw new InvalidRequestException(String.format("Index %s is a duplicate of existing index %s",
+                                                            index.name,
+                                                            existingIndex.get().name));
+
+        logger.debug("Updating index definition for {}", indexName);
+        cfm.indexes(cfm.getIndexes().with(index));
+
         MigrationManager.announceColumnFamilyUpdate(cfm, false, isLocalOnly);
         return true;
     }

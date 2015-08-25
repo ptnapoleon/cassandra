@@ -22,20 +22,16 @@ import java.nio.ByteBuffer;
 import java.util.*;
 
 import com.google.common.collect.Lists;
-
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.ColumnDefinition;
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.config.*;
 import org.apache.cassandra.cql3.Operator;
-import org.apache.cassandra.db.index.SecondaryIndexSearcher;
 import org.apache.cassandra.db.filter.*;
-import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.db.partitions.*;
+import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.dht.AbstractBounds;
+import org.apache.cassandra.index.Index;
 import org.apache.cassandra.io.IVersionedSerializer;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
@@ -43,7 +39,6 @@ import org.apache.cassandra.metrics.TableMetrics;
 import org.apache.cassandra.net.MessageOut;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.service.ClientWarn;
-import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.Pair;
@@ -59,6 +54,9 @@ public abstract class ReadCommand implements ReadQuery
     protected static final Logger logger = LoggerFactory.getLogger(ReadCommand.class);
 
     public static final IVersionedSerializer<ReadCommand> serializer = new Serializer();
+    // For RANGE_SLICE verb: will either dispatch on 'serializer' for 3.0 or 'legacyRangeSliceCommandSerializer' for earlier version.
+    // Can be removed (and replaced by 'serializer') once we drop pre-3.0 backward compatibility.
+    public static final IVersionedSerializer<ReadCommand> rangeSliceSerializer = new RangeSliceSerializer();
 
     public static final IVersionedSerializer<ReadCommand> legacyRangeSliceCommandSerializer = new LegacyRangeSliceCommandSerializer();
     public static final IVersionedSerializer<ReadCommand> legacyPagedRangeCommandSerializer = new LegacyPagedRangeCommandSerializer();
@@ -258,13 +256,15 @@ public abstract class ReadCommand implements ReadQuery
              : ReadResponse.createDataResponse(iterator, selection);
     }
 
-    protected SecondaryIndexSearcher getIndexSearcher(ColumnFamilyStore cfs)
+    protected Index getIndex(ColumnFamilyStore cfs, boolean includeInTrace)
     {
-        return cfs.indexManager.getBestIndexSearcherFor(this);
+        return cfs.indexManager.getBestIndexFor(this, includeInTrace);
     }
 
     /**
      * Executes this command on the local host.
+     *
+     * @param orderGroup the operation group spanning this command
      *
      * @return an iterator over the result of executing this command locally.
      */
@@ -275,10 +275,12 @@ public abstract class ReadCommand implements ReadQuery
         long startTimeNanos = System.nanoTime();
 
         ColumnFamilyStore cfs = Keyspace.openAndGetStore(metadata());
-        SecondaryIndexSearcher searcher = getIndexSearcher(cfs);
+        Index index = getIndex(cfs, true);
+        Index.Searcher searcher = index == null ? null : index.searcherFor(this);
+
         UnfilteredPartitionIterator resultIterator = searcher == null
                                          ? queryStorage(cfs, orderGroup)
-                                         : searcher.search(this, orderGroup);
+                                         : searcher.search(orderGroup);
 
         try
         {
@@ -288,7 +290,7 @@ public abstract class ReadCommand implements ReadQuery
             // no point in checking it again.
             RowFilter updatedFilter = searcher == null
                                     ? rowFilter()
-                                    : rowFilter().without(searcher.primaryClause(this));
+                                    : index.getPostIndexQueryFilter(rowFilter());
 
             // TODO: We'll currently do filtering by the rowFilter here because it's convenient. However,
             // we'll probably want to optimize by pushing it down the layer (like for dropped columns) as it
@@ -411,15 +413,7 @@ public abstract class ReadCommand implements ReadQuery
     /**
      * Creates a message for this command.
      */
-    public MessageOut<ReadCommand> createMessage(int version)
-    {
-        if (version >= MessagingService.VERSION_30)
-            return new MessageOut<>(MessagingService.Verb.READ, this, serializer);
-
-        return createLegacyMessage();
-    }
-
-    protected abstract MessageOut<ReadCommand> createLegacyMessage();
+    public abstract MessageOut<ReadCommand> createMessage(int version);
 
     protected abstract void appendCQLWhereClause(StringBuilder sb);
 
@@ -526,6 +520,33 @@ public abstract class ReadCommand implements ReadQuery
                  + RowFilter.serializer.serializedSize(command.rowFilter(), version)
                  + DataLimits.serializer.serializedSize(command.limits(), version)
                  + command.selectionSerializedSize(version);
+        }
+    }
+
+    // Dispatch to either Serializer or LegacyRangeSliceCommandSerializer. Only useful as long as we maintain pre-3.0
+    // compatibility
+    private static class RangeSliceSerializer implements IVersionedSerializer<ReadCommand>
+    {
+        public void serialize(ReadCommand command, DataOutputPlus out, int version) throws IOException
+        {
+            if (version < MessagingService.VERSION_30)
+                legacyRangeSliceCommandSerializer.serialize(command, out, version);
+            else
+                serializer.serialize(command, out, version);
+        }
+
+        public ReadCommand deserialize(DataInputPlus in, int version) throws IOException
+        {
+            return version < MessagingService.VERSION_30
+                 ? legacyRangeSliceCommandSerializer.deserialize(in, version)
+                 : serializer.deserialize(in, version);
+        }
+
+        public long serializedSize(ReadCommand command, int version)
+        {
+            return version < MessagingService.VERSION_30
+                 ? legacyRangeSliceCommandSerializer.serializedSize(command, version)
+                 : serializer.serializedSize(command, version);
         }
     }
 

@@ -30,11 +30,11 @@ import org.apache.cassandra.cql3.functions.Function;
 import org.apache.cassandra.cql3.statements.Bound;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.filter.RowFilter;
-import org.apache.cassandra.db.index.SecondaryIndexManager;
 import org.apache.cassandra.dht.*;
 import org.apache.cassandra.exceptions.InvalidRequestException;
-import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.index.SecondaryIndexManager;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.btree.BTreeSet;
 
 import static org.apache.cassandra.cql3.statements.RequestValidations.checkFalse;
 import static org.apache.cassandra.cql3.statements.RequestValidations.checkNotNull;
@@ -46,6 +46,8 @@ import static org.apache.cassandra.cql3.statements.RequestValidations.invalidReq
  */
 public final class StatementRestrictions
 {
+    public static final String NO_INDEX_FOUND_MESSAGE =
+        "No supported secondary index found for the non primary key columns restrictions";
     /**
      * The Column Family meta data
      */
@@ -158,7 +160,7 @@ public final class StatementRestrictions
             if (hasQueriableIndex)
                 usesSecondaryIndexing = true;
             else if (!useFiltering)
-                throw new InvalidRequestException("No supported secondary index found for the non primary key columns restrictions");
+                throw new InvalidRequestException(NO_INDEX_FOUND_MESSAGE);
 
             indexRestrictions.add(nonPrimaryKeyRestrictions);
         }
@@ -478,6 +480,12 @@ public final class StatementRestrictions
      */
     public NavigableSet<Clustering> getClusteringColumns(QueryOptions options) throws InvalidRequestException
     {
+        // If this is a names command and the table is a static compact one, then as far as CQL is concerned we have
+        // only a single row which internally correspond to the static parts. In which case we want to return an empty
+        // set (since that's what ClusteringIndexNamesFilter expects).
+        if (cfm.isStaticCompactTable())
+            return BTreeSet.empty(cfm.comparator);
+
         return clusteringColumnsRestrictions.valuesAsClustering(options);
     }
 
@@ -513,7 +521,9 @@ public final class StatementRestrictions
      */
     public boolean isColumnRange()
     {
-        // For static compact tables we need to ignore the fake clustering column.
+        // For static compact tables we want to ignore the fake clustering column (note that if we weren't special casing,
+        // this would mean a 'SELECT *' on a static compact table would query whole partitions, even though we'll only return
+        // the static part as far as CQL is concerned. This is thus mostly an optimization to use the query-by-name path).
         int numberOfClusteringColumns = cfm.isStaticCompactTable() ? 0 : cfm.clusteringColumns().size();
         // it is a range query if it has at least one the column alias for which no relation is defined or is not EQ.
         return clusteringColumnsRestrictions.size() < numberOfClusteringColumns

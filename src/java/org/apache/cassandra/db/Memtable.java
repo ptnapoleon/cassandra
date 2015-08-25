@@ -19,41 +19,42 @@ package org.apache.cassandra.db;
 
 import java.io.File;
 import java.util.*;
-import java.util.concurrent.ConcurrentNavigableMap;
-import java.util.concurrent.ConcurrentSkipListMap;
-import java.util.concurrent.ConcurrentSkipListSet;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 import com.google.common.annotations.VisibleForTesting;
-import org.apache.cassandra.db.compaction.OperationType;
-import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
-import org.apache.cassandra.io.sstable.SSTableTxnWriter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.ColumnDefinition;
 import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.db.commitlog.CommitLog;
 import org.apache.cassandra.db.commitlog.ReplayPosition;
-import org.apache.cassandra.db.index.SecondaryIndexManager;
-import org.apache.cassandra.dht.Murmur3Partitioner.LongToken;
-import org.apache.cassandra.db.filter.*;
+import org.apache.cassandra.db.compaction.OperationType;
+import org.apache.cassandra.db.filter.ClusteringIndexFilter;
+import org.apache.cassandra.db.filter.ColumnFilter;
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.db.partitions.*;
+import org.apache.cassandra.db.rows.EncodingStats;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.dht.*;
+import org.apache.cassandra.dht.Murmur3Partitioner.LongToken;
+import org.apache.cassandra.index.transactions.UpdateTransaction;
 import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.io.sstable.SSTableTxnWriter;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
-import org.apache.cassandra.io.sstable.format.SSTableWriter;
 import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
 import org.apache.cassandra.io.util.DiskAwareRunnable;
 import org.apache.cassandra.service.ActiveRepairService;
-import org.apache.cassandra.utils.*;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.ObjectSizes;
 import org.apache.cassandra.utils.concurrent.OpOrder;
-import org.apache.cassandra.utils.memory.*;
+import org.apache.cassandra.utils.memory.MemtableAllocator;
+import org.apache.cassandra.utils.memory.MemtablePool;
 
 public class Memtable implements Comparable<Memtable>
 {
@@ -209,7 +210,7 @@ public class Memtable implements Comparable<Memtable>
      *
      * replayPosition should only be null if this is a secondary index, in which case it is *expected* to be null
      */
-    long put(PartitionUpdate update, SecondaryIndexManager.Updater indexer, OpOrder.Group opGroup)
+    long put(PartitionUpdate update, UpdateTransaction indexer, OpOrder.Group opGroup)
     {
         AtomicBTreePartition previous = partitions.get(update.partitionKey());
 
@@ -345,22 +346,22 @@ public class Memtable implements Comparable<Memtable>
         {
             long writeSize = getExpectedWriteSize();
             Directories.DataDirectory dataDirectory = getWriteDirectory(writeSize);
-            File sstableDirectory = cfs.directories.getLocationForDisk(dataDirectory);
+            File sstableDirectory = cfs.getDirectories().getLocationForDisk(dataDirectory);
             assert sstableDirectory != null : "Flush task is not bound to any disk";
-            SSTableReader sstable = writeSortedContents(context, sstableDirectory);
-            cfs.replaceFlushed(Memtable.this, sstable);
+            Collection<SSTableReader> sstables = writeSortedContents(context, sstableDirectory);
+            cfs.replaceFlushed(Memtable.this, sstables);
         }
 
         protected Directories getDirectories()
         {
-            return cfs.directories;
+            return cfs.getDirectories();
         }
 
-        private SSTableReader writeSortedContents(ReplayPosition context, File sstableDirectory)
+        private Collection<SSTableReader> writeSortedContents(ReplayPosition context, File sstableDirectory)
         {
             logger.info("Writing {}", Memtable.this.toString());
 
-            SSTableReader ssTable;
+            Collection<SSTableReader> ssTables;
             try (SSTableTxnWriter writer = createFlushWriter(cfs.getSSTablePath(sstableDirectory), columnsCollector.get(), statsCollector.get()))
             {
                 boolean trackContention = logger.isDebugEnabled();
@@ -397,20 +398,20 @@ public class Memtable implements Comparable<Memtable>
                                               context));
 
                     // sstables should contain non-repaired data.
-                    ssTable = writer.finish(true);
+                    ssTables = writer.finish(true);
                 }
                 else
                 {
                     logger.info("Completed flushing {}; nothing needed to be retained.  Commitlog position was {}",
                                 writer.getFilename(), context);
                     writer.abort();
-                    ssTable = null;
+                    ssTables = null;
                 }
 
                 if (heavilyContendedRowCount > 0)
                     logger.debug(String.format("High update contention in %d/%d partitions of %s ", heavilyContendedRowCount, partitions.size(), Memtable.this.toString()));
 
-                return ssTable;
+                return ssTables;
             }
         }
 
@@ -423,13 +424,12 @@ public class Memtable implements Comparable<Memtable>
             LifecycleTransaction txn = LifecycleTransaction.offline(OperationType.FLUSH, cfs.metadata);
             MetadataCollector sstableMetadataCollector = new MetadataCollector(cfs.metadata.comparator).replayPosition(context);
             return new SSTableTxnWriter(txn,
-                                        SSTableWriter.create(Descriptor.fromFilename(filename),
-                                                             (long)partitions.size(),
-                                                             ActiveRepairService.UNREPAIRED_SSTABLE,
-                                                             cfs.metadata,
-                                                             sstableMetadataCollector,
-                                                             new SerializationHeader(cfs.metadata, columns, stats),
-                                                             txn));
+                                        cfs.createSSTableMultiWriter(Descriptor.fromFilename(filename),
+                                                                     (long)partitions.size(),
+                                                                     ActiveRepairService.UNREPAIRED_SSTABLE,
+                                                                     sstableMetadataCollector,
+                                                                     new SerializationHeader(cfs.metadata, columns, stats),
+                                                                     txn));
         }
     }
 

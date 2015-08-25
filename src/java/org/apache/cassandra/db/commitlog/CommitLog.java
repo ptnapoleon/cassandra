@@ -48,6 +48,8 @@ import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.JVMStabilityInspector;
 
 import static org.apache.cassandra.db.commitlog.CommitLogSegment.*;
+import static org.apache.cassandra.utils.FBUtilities.updateChecksum;
+import static org.apache.cassandra.utils.FBUtilities.updateChecksumInt;
 
 /*
  * Commit Log tracks every write operation into the system. The aim of the commit log is to be able to
@@ -61,7 +63,7 @@ public class CommitLog implements CommitLogMBean
 
     // we only permit records HALF the size of a commit log, to ensure we don't spin allocating many mostly
     // empty segments when writing large records
-    private final long MAX_MUTATION_SIZE = DatabaseDescriptor.getCommitLogSegmentSize() >> 1;
+    private final long MAX_MUTATION_SIZE = DatabaseDescriptor.getMaxMutationSize();
 
     public final CommitLogSegmentManager allocator;
     public final CommitLogArchiver archiver;
@@ -74,7 +76,7 @@ public class CommitLog implements CommitLogMBean
 
     private static CommitLog construct()
     {
-        CommitLog log = new CommitLog(DatabaseDescriptor.getCommitLogLocation(), new CommitLogArchiver());
+        CommitLog log = new CommitLog(DatabaseDescriptor.getCommitLogLocation(), CommitLogArchiver.construct());
 
         MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
         try
@@ -85,7 +87,7 @@ public class CommitLog implements CommitLogMBean
         {
             throw new RuntimeException(e);
         }
-        return log;
+        return log.start();
     }
 
     @VisibleForTesting
@@ -105,10 +107,16 @@ public class CommitLog implements CommitLogMBean
                 : new PeriodicCommitLogService(this);
 
         allocator = new CommitLogSegmentManager(this);
-        executor.start();
 
         // register metrics
         metrics.attach(executor, allocator);
+    }
+
+    CommitLog start()
+    {
+        executor.start();
+        allocator.start();
+        return this;
     }
 
     /**
@@ -177,7 +185,7 @@ public class CommitLog implements CommitLogMBean
      */
     public int recover(File... clogs) throws IOException
     {
-        CommitLogReplayer recovery = CommitLogReplayer.create();
+        CommitLogReplayer recovery = CommitLogReplayer.construct(this);
         recovery.recover(clogs);
         return recovery.blockForWrites();
     }
@@ -187,7 +195,9 @@ public class CommitLog implements CommitLogMBean
      */
     public void recover(String path) throws IOException
     {
-        recover(new File(path));
+        CommitLogReplayer recovery = CommitLogReplayer.construct(this);
+        recovery.recover(new File(path), false);
+        recovery.blockForWrites();
     }
 
     /**
@@ -246,9 +256,9 @@ public class CommitLog implements CommitLogMBean
     {
         assert mutation != null;
 
-        long size = Mutation.serializer.serializedSize(mutation, MessagingService.current_version);
+        int size = (int) Mutation.serializer.serializedSize(mutation, MessagingService.current_version);
 
-        long totalSize = size + ENTRY_OVERHEAD_SIZE;
+        int totalSize = size + ENTRY_OVERHEAD_SIZE;
         if (totalSize > MAX_MUTATION_SIZE)
         {
             throw new IllegalArgumentException(String.format("Mutation of %s bytes is too large for the maxiumum size of %s",
@@ -261,19 +271,13 @@ public class CommitLog implements CommitLogMBean
         try (BufferedDataOutputStreamPlus dos = new DataOutputBufferFixed(buffer))
         {
             // checksummed length
-            dos.writeInt((int) size);
-
-            ByteBuffer copy = buffer.duplicate();
-            copy.position(buffer.position() - 4);
-            copy.limit(buffer.position());
-            checksum.update(copy);
+            dos.writeInt(size);
+            updateChecksumInt(checksum, size);
             buffer.putInt((int) checksum.getValue());
 
             // checksummed mutation
-            copy = buffer.duplicate();
             Mutation.serializer.serialize(mutation, dos, MessagingService.current_version);
-            copy.limit(copy.position() + (int) size);
-            checksum.update(copy);
+            updateChecksum(checksum, buffer, buffer.position() - size, size);
             buffer.putInt((int) checksum.getValue());
         }
         catch (IOException e)
@@ -412,7 +416,7 @@ public class CommitLog implements CommitLogMBean
     public int resetUnsafe(boolean deleteSegments) throws IOException
     {
         stopUnsafe(deleteSegments);
-        return startUnsafe();
+        return restartUnsafe();
     }
 
     /**
@@ -435,10 +439,10 @@ public class CommitLog implements CommitLogMBean
     /**
      * FOR TESTING PURPOSES.  See CommitLogAllocator
      */
-    public int startUnsafe() throws IOException
+    public int restartUnsafe() throws IOException
     {
-        allocator.startUnsafe();
-        executor.startUnsafe();
+        allocator.start();
+        executor.restartUnsafe();
         return recover();
     }
 

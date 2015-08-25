@@ -35,20 +35,24 @@ import org.apache.cassandra.cql3.restrictions.StatementRestrictions;
 import org.apache.cassandra.cql3.selection.RawSelector;
 import org.apache.cassandra.cql3.selection.Selection;
 import org.apache.cassandra.db.*;
-import org.apache.cassandra.db.rows.*;
-import org.apache.cassandra.db.partitions.*;
 import org.apache.cassandra.db.filter.*;
-import org.apache.cassandra.db.index.SecondaryIndexManager;
 import org.apache.cassandra.db.marshal.CollectionType;
 import org.apache.cassandra.db.marshal.CompositeType;
 import org.apache.cassandra.db.marshal.Int32Type;
+import org.apache.cassandra.db.partitions.PartitionIterator;
+import org.apache.cassandra.db.rows.ComplexColumnData;
+import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.db.rows.RowIterator;
 import org.apache.cassandra.db.view.MaterializedView;
 import org.apache.cassandra.dht.AbstractBounds;
 import org.apache.cassandra.exceptions.*;
+import org.apache.cassandra.index.SecondaryIndexManager;
 import org.apache.cassandra.serializers.MarshalException;
-import org.apache.cassandra.service.*;
-import org.apache.cassandra.service.pager.QueryPager;
+import org.apache.cassandra.service.ClientState;
+import org.apache.cassandra.service.ClientWarn;
+import org.apache.cassandra.service.QueryState;
 import org.apache.cassandra.service.pager.PagingState;
+import org.apache.cassandra.service.pager.QueryPager;
 import org.apache.cassandra.thrift.ThriftValidation;
 import org.apache.cassandra.transport.messages.ResultMessage;
 import org.apache.cassandra.utils.ByteBufferUtil;
@@ -74,6 +78,10 @@ public class SelectStatement implements CQLStatement
     private static final Logger logger = LoggerFactory.getLogger(SelectStatement.class);
 
     private static final int DEFAULT_COUNT_PAGE_SIZE = 10000;
+    public static final String REQUIRES_ALLOW_FILTERING_MESSAGE =
+        "Cannot execute this query as it might involve data filtering and " +
+        "thus may have unpredictable performance. If you want to execute " +
+        "this query despite the performance unpredictability, use ALLOW FILTERING";
 
     private final int boundTerms;
     public final CFMetaData cfm;
@@ -484,7 +492,10 @@ public class SelectStatement implements CQLStatement
         else
         {
             NavigableSet<Clustering> clusterings = getRequestedRows(options);
-            if (clusterings.isEmpty() && !selection.containsStaticColumns()) // in case of IN () for the last column of the key
+            // We can have no clusterings if either we're only selecting the static columns, or if we have
+            // a 'IN ()' for clusterings. In that case, we still want to query if some static columns are
+            // queried. But we're fine otherwise.
+            if (clusterings.isEmpty() && queriedColumns.fetchedColumns().statics.isEmpty())
                 return null;
 
             return new ClusteringIndexNamesFilter(clusterings, isReversed);
@@ -578,7 +589,6 @@ public class SelectStatement implements CQLStatement
         ColumnFamilyStore cfs = Keyspace.open(keyspace()).getColumnFamilyStore(columnFamily());
         SecondaryIndexManager secondaryIndexManager = cfs.indexManager;
         RowFilter filter = restrictions.getRowFilter(secondaryIndexManager, options);
-        secondaryIndexManager.validateFilter(filter);
         return filter;
     }
 
@@ -747,6 +757,8 @@ public class SelectStatement implements CQLStatement
                 verifyOrderingIsAllowed(restrictions);
                 orderingComparator = getOrderingComparator(cfm, selection, restrictions);
                 isReversed = isReversed(cfm);
+                if (isReversed)
+                    orderingComparator = Collections.reverseOrder(orderingComparator);
             }
 
             checkNeedsFiltering(restrictions);
@@ -932,10 +944,7 @@ public class SelectStatement implements CQLStatement
                 // We will potentially filter data if either:
                 //  - Have more than one IndexExpression
                 //  - Have no index expression and the row filter is not the identity
-                checkFalse(restrictions.needFiltering(),
-                           "Cannot execute this query as it might involve data filtering and " +
-                           "thus may have unpredictable performance. If you want to execute " +
-                           "this query despite the performance unpredictability, use ALLOW FILTERING");
+                checkFalse(restrictions.needFiltering(), REQUIRES_ALLOW_FILTERING_MESSAGE);
             }
         }
 

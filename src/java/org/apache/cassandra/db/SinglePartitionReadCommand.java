@@ -317,7 +317,7 @@ public abstract class SinglePartitionReadCommand<F extends ClusteringIndexFilter
                 try
                 {
                     // We want to cache only rowsToCache rows
-                    CachedPartition toCache = ArrayBackedCachedPartition.create(DataLimits.cqlLimits(rowsToCache).filter(iter, nowInSec()), nowInSec());
+                    CachedPartition toCache = CachedBTreePartition.create(DataLimits.cqlLimits(rowsToCache).filter(iter, nowInSec()), nowInSec());
                     if (sentinelSuccess && !toCache.isEmpty())
                     {
                         Tracing.trace("Caching {} rows", toCache.rowCount());
@@ -395,9 +395,9 @@ public abstract class SinglePartitionReadCommand<F extends ClusteringIndexFilter
                              nowInSec());
     }
 
-    protected MessageOut<ReadCommand> createLegacyMessage()
+    public MessageOut<ReadCommand> createMessage(int version)
     {
-        return new MessageOut<>(MessagingService.Verb.READ, this, legacyReadCommandSerializer);
+        return new MessageOut<>(MessagingService.Verb.READ, this, version < MessagingService.VERSION_30 ? legacyReadCommandSerializer : serializer);
     }
 
     protected void appendCQLWhereClause(StringBuilder sb)

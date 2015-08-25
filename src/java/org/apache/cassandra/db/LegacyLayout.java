@@ -319,7 +319,7 @@ public abstract class LegacyLayout
     {
         // we need to extract the range tombstone so materialize the partition. Since this is
         // used for the on-wire format, this is not worst than it used to be.
-        final ArrayBackedPartition partition = ArrayBackedPartition.create(iterator);
+        final ImmutableBTreePartition partition = ImmutableBTreePartition.create(iterator);
         DeletionInfo info = partition.deletionInfo();
         Pair<LegacyRangeTombstoneList, Iterator<LegacyCell>> pair = fromRowIterator(partition.metadata(), partition.iterator(), partition.staticRow());
 
@@ -465,11 +465,11 @@ public abstract class LegacyLayout
     // For thrift sake
     public static UnfilteredRowIterator toUnfilteredRowIterator(CFMetaData metadata,
                                                                 DecoratedKey key,
-                                                                DeletionInfo delInfo,
+                                                                LegacyDeletionInfo delInfo,
                                                                 Iterator<LegacyCell> cells)
     {
         SerializationHelper helper = new SerializationHelper(metadata, 0, SerializationHelper.Flag.LOCAL);
-        return toUnfilteredRowIterator(metadata, key, LegacyDeletionInfo.from(delInfo), cells, false, helper);
+        return toUnfilteredRowIterator(metadata, key, delInfo, cells, false, helper);
     }
 
     // For deserializing old wire format
@@ -538,7 +538,7 @@ public abstract class LegacyLayout
         for (ColumnDefinition column : statics)
             columnsToFetch.add(column.name.bytes);
 
-        Row.Builder builder = BTreeBackedRow.unsortedBuilder(statics, FBUtilities.nowInSeconds());
+        Row.Builder builder = BTreeRow.unsortedBuilder(statics, FBUtilities.nowInSeconds());
         builder.newRow(Clustering.STATIC_CLUSTERING);
 
         boolean foundOne = false;
@@ -1058,8 +1058,7 @@ public abstract class LegacyLayout
             // We cannot use a sorted builder because we don't have exactly the same ordering in 3.0 and pre-3.0. More precisely, within a row, we
             // store all simple columns before the complex ones in 3.0, which we use to sort everything sorted by the column name before. Note however
             // that the unsorted builder won't have to reconcile cells, so the exact value we pass for nowInSec doesn't matter.
-            this.builder = BTreeBackedRow.unsortedBuilder(isStatic ? metadata.partitionColumns().statics : metadata.partitionColumns().regulars, FBUtilities.nowInSeconds());
-
+            this.builder = BTreeRow.unsortedBuilder(isStatic ? metadata.partitionColumns().statics : metadata.partitionColumns().regulars, FBUtilities.nowInSeconds());
         }
 
         public static CellGrouper staticGrouper(CFMetaData metadata, SerializationHelper helper)
@@ -1405,8 +1404,7 @@ public abstract class LegacyLayout
         public final LegacyBound stop;
         public final DeletionTime deletionTime;
 
-        // Do not use directly, use create() instead.
-        private LegacyRangeTombstone(LegacyBound start, LegacyBound stop, DeletionTime deletionTime)
+        public LegacyRangeTombstone(LegacyBound start, LegacyBound stop, DeletionTime deletionTime)
         {
             // Because of the way RangeTombstoneList work, we can have a tombstone where only one of
             // the bound has a collectionName. That happens if we have a big tombstone A (spanning one
@@ -1489,33 +1487,35 @@ public abstract class LegacyLayout
 
     public static class LegacyDeletionInfo
     {
-        public final DeletionInfo deletionInfo;
-        public final List<LegacyRangeTombstone> inRowTombstones;
+        public final MutableDeletionInfo deletionInfo;
+        public final List<LegacyRangeTombstone> inRowTombstones = new ArrayList<>();
 
-        private LegacyDeletionInfo(DeletionInfo deletionInfo, List<LegacyRangeTombstone> inRowTombstones)
+        private LegacyDeletionInfo(MutableDeletionInfo deletionInfo)
         {
             this.deletionInfo = deletionInfo;
-            this.inRowTombstones = inRowTombstones;
-        }
-
-        public static LegacyDeletionInfo from(DeletionInfo info)
-        {
-            List<LegacyRangeTombstone> rangeTombstones = new ArrayList<>(info.rangeCount());
-            Iterator<RangeTombstone> iterator = info.rangeIterator(false);
-            while (iterator.hasNext())
-            {
-                RangeTombstone rt = iterator.next();
-                Slice slice = rt.deletedSlice();
-                rangeTombstones.add(new LegacyRangeTombstone(new LegacyBound(slice.start(), false, null),
-                                                             new LegacyBound(slice.end(), false, null),
-                                                             rt.deletionTime()));
-            }
-            return new LegacyDeletionInfo(info, rangeTombstones);
         }
 
         public static LegacyDeletionInfo live()
         {
-            return from(DeletionInfo.LIVE);
+            return new LegacyDeletionInfo(MutableDeletionInfo.live());
+        }
+
+        public void add(DeletionTime topLevel)
+        {
+            deletionInfo.add(topLevel);
+        }
+
+        public void add(CFMetaData metadata, LegacyRangeTombstone tombstone)
+        {
+            if (tombstone.isCollectionTombstone() || tombstone.isRowDeletion(metadata))
+                inRowTombstones.add(tombstone);
+            else
+                add(metadata, new RangeTombstone(Slice.make(tombstone.start.bound, tombstone.stop.bound), tombstone.deletionTime));
+        }
+
+        public void add(CFMetaData metadata, RangeTombstone tombstone)
+        {
+            deletionInfo.add(tombstone, metadata.comparator);
         }
 
         public Iterator<LegacyRangeTombstone> inRowRangeTombstones()
@@ -1529,10 +1529,9 @@ public abstract class LegacyLayout
 
             int rangeCount = in.readInt();
             if (rangeCount == 0)
-                return from(new MutableDeletionInfo(topLevel));
+                return new LegacyDeletionInfo(new MutableDeletionInfo(topLevel));
 
-            RangeTombstoneList ranges = new RangeTombstoneList(metadata.comparator, rangeCount);
-            List<LegacyRangeTombstone> inRowTombsones = new ArrayList<>();
+            LegacyDeletionInfo delInfo = new LegacyDeletionInfo(new MutableDeletionInfo(topLevel));
             for (int i = 0; i < rangeCount; i++)
             {
                 LegacyBound start = decodeBound(metadata, ByteBufferUtil.readWithShortLength(in), true);
@@ -1540,13 +1539,9 @@ public abstract class LegacyLayout
                 int delTime =  in.readInt();
                 long markedAt = in.readLong();
 
-                LegacyRangeTombstone tombstone = new LegacyRangeTombstone(start, end, new DeletionTime(markedAt, delTime));
-                if (tombstone.isCollectionTombstone() || tombstone.isRowDeletion(metadata))
-                    inRowTombsones.add(tombstone);
-                else
-                    ranges.add(start.bound, end.bound, markedAt, delTime);
+                delInfo.add(metadata, new LegacyRangeTombstone(start, end, new DeletionTime(markedAt, delTime)));
             }
-            return new LegacyDeletionInfo(new MutableDeletionInfo(topLevel, ranges), inRowTombsones);
+            return delInfo;
         }
     }
 

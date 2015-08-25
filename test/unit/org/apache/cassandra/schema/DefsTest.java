@@ -34,16 +34,17 @@ import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.Util;
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.ColumnDefinition;
-import org.apache.cassandra.config.IndexType;
 import org.apache.cassandra.config.Schema;
 import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.Directories;
 import org.apache.cassandra.db.Keyspace;
-import org.apache.cassandra.db.lifecycle.TransactionLogs;
+import org.apache.cassandra.db.lifecycle.TransactionLog;
 import org.apache.cassandra.db.marshal.BytesType;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.index.Index;
 import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.locator.OldNetworkTopologyStrategy;
@@ -100,7 +101,7 @@ public class DefsTest
         for (int i = 0; i < 5; i++)
         {
             ByteBuffer name = ByteBuffer.wrap(new byte[] { (byte)i });
-            cfm.addColumnDefinition(ColumnDefinition.regularDef(cfm, name, BytesType.instance).setIndex(Integer.toString(i), IndexType.KEYS, null));
+            cfm.addColumnDefinition(ColumnDefinition.regularDef(cfm, name, BytesType.instance));
         }
 
         cfm.comment("No comment")
@@ -115,13 +116,11 @@ public class DefsTest
         CFMetaData cfNew = cfm.copy();
 
         // add one.
-        ColumnDefinition addIndexDef = ColumnDefinition.regularDef(cfm, ByteBuffer.wrap(new byte[] { 5 }), BytesType.instance)
-                                                       .setIndex("5", IndexType.KEYS, null);
+        ColumnDefinition addIndexDef = ColumnDefinition.regularDef(cfm, ByteBuffer.wrap(new byte[] { 5 }), BytesType.instance);
         cfNew.addColumnDefinition(addIndexDef);
 
         // remove one.
-        ColumnDefinition removeIndexDef = ColumnDefinition.regularDef(cfm, ByteBuffer.wrap(new byte[] { 0 }), BytesType.instance)
-                                                          .setIndex("0", IndexType.KEYS, null);
+        ColumnDefinition removeIndexDef = ColumnDefinition.regularDef(cfm, ByteBuffer.wrap(new byte[] { 0 }), BytesType.instance);
         assertTrue(cfNew.removeColumnDefinition(removeIndexDef));
 
         cfm.apply(cfNew);
@@ -205,7 +204,7 @@ public class DefsTest
         ColumnFamilyStore store = Keyspace.open(cfm.ksName).getColumnFamilyStore(cfm.cfName);
         assertNotNull(store);
         store.forceBlockingFlush();
-        assertTrue(store.directories.sstableLister().list().size() > 0);
+        assertTrue(store.getDirectories().sstableLister(Directories.OnTxnErr.THROW).list().size() > 0);
 
         MigrationManager.announceColumnFamilyDrop(ks.name, cfm.cfName);
 
@@ -227,7 +226,7 @@ public class DefsTest
 
         // verify that the files are gone.
         Supplier<Object> lambda = () -> {
-            for (File file : store.directories.sstableLister().listFiles())
+            for (File file : store.getDirectories().sstableLister(Directories.OnTxnErr.THROW).listFiles())
             {
                 if (file.getPath().endsWith("Data.db") && !new File(file.getPath().replace("Data.db", "Compacted")).exists())
                     return false;
@@ -276,7 +275,7 @@ public class DefsTest
         ColumnFamilyStore cfs = Keyspace.open(cfm.ksName).getColumnFamilyStore(cfm.cfName);
         assertNotNull(cfs);
         cfs.forceBlockingFlush();
-        assertTrue(!cfs.directories.sstableLister().list().isEmpty());
+        assertTrue(!cfs.getDirectories().sstableLister(Directories.OnTxnErr.THROW).list().isEmpty());
 
         MigrationManager.announceKeyspaceDrop(ks.name);
 
@@ -504,24 +503,50 @@ public class DefsTest
         ColumnFamilyStore cfs = Keyspace.open(KEYSPACE6).getColumnFamilyStore(TABLE1i);
 
         // insert some data.  save the sstable descriptor so we can make sure it's marked for delete after the drop
-        QueryProcessor.executeInternal(String.format("INSERT INTO %s.%s (key, c1, birthdate, notbirthdate) VALUES (?, ?, ?, ?)",
-                                                     KEYSPACE6, TABLE1i),
+        QueryProcessor.executeInternal(String.format(
+                                                    "INSERT INTO %s.%s (key, c1, birthdate, notbirthdate) VALUES (?, ?, ?, ?)",
+                                                    KEYSPACE6,
+                                                    TABLE1i),
                                        "key0", "col0", 1L, 1L);
 
         cfs.forceBlockingFlush();
-        ColumnFamilyStore indexedCfs = cfs.indexManager.getIndexForColumn(cfs.metadata.getColumnDefinition(ByteBufferUtil.bytes("birthdate"))).getIndexCfs();
-        Descriptor desc = indexedCfs.getLiveSSTables().iterator().next().descriptor;
+        ColumnDefinition indexedColumn = cfs.metadata.getColumnDefinition(ByteBufferUtil.bytes("birthdate"));
+        IndexMetadata index = cfs.metadata.getIndexes()
+                                          .get(indexedColumn)
+                                          .iterator()
+                                          .next();
+        ColumnFamilyStore indexCfs = cfs.indexManager.listIndexes()
+                                                     .stream()
+                                                     .filter(i -> i.getIndexMetadata().equals(index))
+                                                     .map(Index::getBackingTable)
+                                                     .findFirst()
+                                                     .orElseThrow(() -> new AssertionError("Index not found"))
+                                                     .orElseThrow(() -> new AssertionError("Index has no backing table"));
+        Descriptor desc = indexCfs.getLiveSSTables().iterator().next().descriptor;
 
         // drop the index
         CFMetaData meta = cfs.metadata.copy();
-        ColumnDefinition cdOld = cfs.metadata.getColumnDefinition(ByteBufferUtil.bytes("birthdate"));
-        ColumnDefinition cdNew = ColumnDefinition.regularDef(meta, cdOld.name.bytes, cdOld.type);
-        meta.addOrReplaceColumnDefinition(cdNew);
+        // We currently have a mismatch between IndexMetadata.name (which is simply the name
+        // of the index) and what gets returned from SecondaryIndex#getIndexName() (usually, this
+        // defaults to <tablename>.<indexname>.
+        // IndexMetadata takes its lead from the prior implementation of ColumnDefinition.name
+        // which did not include the table name.
+        // This mismatch causes some other, long standing inconsistencies:
+        // nodetool rebuild_index <ks> <tbl> <idx>  - <idx> must be qualified, i.e. include the redundant table name
+        //                                            without it, the rebuild silently fails
+        // system.IndexInfo (which is also exposed over JMX as CF.BuildIndexes) uses the form <tbl>.<idx>
+        // cqlsh> describe index [<ks>.]<idx>  - here <idx> must not be qualified by the table name.
+        //
+        // This should get resolved as part of #9459 by better separating the index name from the
+        // name of it's underlying CFS (if it as one), as the comment in CFMetaData#indexColumnFamilyName promises
+        // Then we will be able to just use the value of SI#getIndexName() when removing an index from CFMetaData
+        IndexMetadata existing = meta.getIndexes().iterator().next();
+        meta.indexes(meta.getIndexes().without(existing.name));
         MigrationManager.announceColumnFamilyUpdate(meta, false);
 
         // check
-        assertTrue(cfs.indexManager.getIndexes().isEmpty());
-        TransactionLogs.waitForDeletions();
+        assertTrue(cfs.indexManager.listIndexes().isEmpty());
+        TransactionLog.waitForDeletions();
         assertFalse(new File(desc.filenameFor(Component.DATA)).exists());
     }
 
