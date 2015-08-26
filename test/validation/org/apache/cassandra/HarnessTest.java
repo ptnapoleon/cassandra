@@ -96,7 +96,6 @@ public class HarnessTest
     public void harness()
     {
         config = loadConfig(getConfigURL(yaml));
-        cleanConfig(config);
         cluster = new CCMBridge(config);
         HarnessContext context = new HarnessContext(this, cluster);
         for (String[] moduleGroup : config.modules)
@@ -246,6 +245,7 @@ public class HarnessTest
             org.yaml.snakeyaml.constructor.Constructor constructor = new org.yaml.snakeyaml.constructor.Constructor(Config.class);
             Yaml yaml = new Yaml(constructor);
             Config result = yaml.loadAs(new ByteArrayInputStream(configBytes), Config.class);
+            cleanConfig(result);
             return result;
         }
         catch (YAMLException e)
