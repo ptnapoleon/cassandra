@@ -134,6 +134,10 @@ do
   JVM_OPTS="$JVM_OPTS $opt"
 done
 
+echo "JVM OPTS"
+echo $JVM_OPTS
+echo ""
+
 # Check what parameters were defined on jvm.options file to avoid conflicts
 echo $JVM_OPTS | grep -q Xmn
 DEFINED_XMN=$?
